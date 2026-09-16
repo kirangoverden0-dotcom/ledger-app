@@ -1,18 +1,30 @@
 const BOOKS = {
-  santhoor: { label: "Santhoor Book", cls: "" },
+  santhoor: { label: "Santoor Book", cls: "" },
   mtr: { label: "MTR Book", cls: "mtr" },
 };
 
 const state = {
   authed: false,
-  screen: "loading", // loading | login | home | list | detail | addRetailer | entry
+  pinSet: true,
+  screen: "loading", // loading | login | pinSetup | home | list | detail | addRetailer | entry | collectionEntry | monthlyReport
   book: "santhoor",
   retailers: [],
   activeRetailer: null,
   entryType: "payment",
   query: "",
   loginError: "",
+  pinSetupError: "",
   confirm: null,
+  // Report state
+  reportBook: "santhoor",
+  reportFrom: "",
+  reportTo: "",
+  reportData: null,
+  // Collection entry state
+  collectionBook: "santhoor",
+  collectionRetailerId: null,
+  collectionDate: localISODate(new Date()),
+  collectionAmount: "",
 };
 
 const app = document.getElementById("app");
@@ -20,6 +32,17 @@ const app = document.getElementById("app");
 function inr(n) {
   n = Number(n) || 0;
   return "\u20B9" + n.toLocaleString("en-IN", { maximumFractionDigits: 0 });
+}
+
+function localISODate(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function plainNum(n) {
+  return Number(n || 0).toLocaleString("en-IN", { maximumFractionDigits: 0 });
 }
 
 async function api(path, opts = {}) {
@@ -39,16 +62,73 @@ async function api(path, opts = {}) {
   return data;
 }
 
+function startSpeechToText(onResult, onError) {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    if (onError) onError("Speech recognition not supported in browser. Use keyboard mic.");
+    return;
+  }
+  const rec = new SpeechRecognition();
+  rec.lang = "en-IN";
+  rec.interimResults = false;
+  rec.maxAlternatives = 1;
+  rec.onresult = (e) => {
+    const text = e.results[0][0].transcript;
+    const numbers = text.replace(/[^0-9]/g, "");
+    if (numbers) {
+      onResult(numbers);
+    } else if (onError) {
+      onError("Recognized: '" + text + "'. No numbers found.");
+    }
+  };
+  rec.onerror = (e) => {
+    if (onError) onError("Voice error: " + (e.error || "Could not hear"));
+  };
+  rec.start();
+}
+
+function startSpeechToTextForName(onResult, onError) {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    if (onError) onError("Speech recognition not supported in browser.");
+    return;
+  }
+  const rec = new SpeechRecognition();
+  rec.lang = "en-IN";
+  rec.interimResults = false;
+  rec.maxAlternatives = 1;
+  rec.onresult = (e) => {
+    const text = e.results[0][0].transcript;
+    if (text && text.trim()) {
+      onResult(text.trim());
+    } else if (onError) {
+      onError("No speech recognized. Try speaking clearly.");
+    }
+  };
+  rec.onerror = (e) => {
+    if (onError) onError("Voice error: " + (e.error || "Could not hear"));
+  };
+  rec.start();
+}
+
 // ---------------- boot ----------------
 
 async function boot() {
   try {
     const s = await api("/session");
     state.authed = !!s.authed;
+    state.pinSet = s.pin_set !== undefined ? !!s.pin_set : true;
   } catch (e) {
     state.authed = false;
+    state.pinSet = true;
   }
-  state.screen = state.authed ? "home" : "login";
+  if (!state.pinSet) {
+    state.screen = "pinSetup";
+  } else if (state.authed) {
+    state.screen = "home";
+  } else {
+    state.screen = "login";
+  }
   render();
 }
 
@@ -57,12 +137,15 @@ async function boot() {
 function render() {
   app.innerHTML = "";
   if (state.screen === "loading") return app.appendChild(el(`<div class="loading-screen">Loading ledger…</div>`));
+  if (state.screen === "pinSetup") return app.appendChild(renderPinSetup());
   if (state.screen === "login") return app.appendChild(renderLogin());
   if (state.screen === "home") return renderHome();
   if (state.screen === "list") return renderList();
   if (state.screen === "addRetailer") return app.appendChild(renderAddRetailer());
   if (state.screen === "detail") return renderDetail();
   if (state.screen === "entry") return app.appendChild(renderEntry());
+  if (state.screen === "collectionEntry") return app.appendChild(renderCollectionEntry());
+  if (state.screen === "monthlyReport") return renderMonthlyReport();
 }
 
 function el(html) {
@@ -84,7 +167,52 @@ function topbar(title, opts = {}) {
   return bar;
 }
 
-// ---------------- login ----------------
+// ---------------- PIN setup & login ----------------
+
+function renderPinSetup() {
+  const wrap = el(`
+    <div class="login-wrap">
+      <h1>Set Security PIN</h1>
+      <div class="subtitle" style="text-align:center;margin-bottom:16px;">Create a security PIN for your ledger app</div>
+      ${state.pinSetupError ? `<div class="error">${state.pinSetupError}</div>` : ""}
+      <input id="newPinInput" type="password" inputmode="numeric" maxlength="6" placeholder="New PIN" autofocus />
+      <input id="confirmPinInput" type="password" inputmode="numeric" maxlength="6" placeholder="Confirm PIN" style="margin-top:8px" />
+      <button id="setupBtn" style="margin-top:14px">Save & Unlock</button>
+    </div>
+  `);
+  const submit = async () => {
+    const p1 = wrap.querySelector("#newPinInput").value.trim();
+    const p2 = wrap.querySelector("#confirmPinInput").value.trim();
+    if (!p1 || p1.length < 4) {
+      state.pinSetupError = "PIN must be at least 4 digits";
+      render();
+      return;
+    }
+    if (p1 !== p2) {
+      state.pinSetupError = "PINs do not match";
+      render();
+      return;
+    }
+    try {
+      await api("/pin/setup", { method: "POST", body: JSON.stringify({ pin: p1 }) });
+      state.authed = true;
+      state.pinSet = true;
+      state.pinSetupError = "";
+      state.screen = "home";
+      render();
+    } catch (e) {
+      state.pinSetupError = e.message || "Could not save PIN";
+      render();
+    }
+  };
+  wrap.querySelector("#setupBtn").onclick = submit;
+  wrap.querySelectorAll("input").forEach((inp) => {
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") submit();
+    });
+  });
+  return wrap;
+}
 
 function renderLogin() {
   const wrap = el(`
@@ -104,6 +232,12 @@ function renderLogin() {
       state.screen = "home";
       render();
     } catch (e) {
+      if (e.message === "pin_not_set") {
+        state.pinSet = false;
+        state.screen = "pinSetup";
+        render();
+        return;
+      }
       state.loginError = "Wrong PIN, try again";
       render();
     }
@@ -113,6 +247,42 @@ function renderLogin() {
     if (e.key === "Enter") submit();
   });
   return wrap;
+}
+
+function showChangePinModal() {
+  hideConfirm();
+  const backdrop = el(`
+    <div class="modal-backdrop" id="confirmBackdrop">
+      <div class="modal-card">
+        <div class="title">Change Security PIN</div>
+        <div class="body">Enter new PIN for this application.</div>
+        <div class="field">
+          <label>New PIN (4-6 digits)</label>
+          <input type="password" id="changePinInput" inputmode="numeric" maxlength="6" autofocus />
+        </div>
+        <div class="modal-actions" style="margin-top:14px">
+          <button class="cancel">Cancel</button>
+          <button class="primary">Save PIN</button>
+        </div>
+      </div>
+    </div>
+  `);
+  backdrop.querySelector(".cancel").onclick = hideConfirm;
+  backdrop.querySelector(".primary").onclick = async () => {
+    const newPin = backdrop.querySelector("#changePinInput").value.trim();
+    if (!newPin || newPin.length < 4) {
+      alert("PIN must be at least 4 digits");
+      return;
+    }
+    try {
+      await api("/pin/change", { method: "POST", body: JSON.stringify({ new_pin: newPin }) });
+      hideConfirm();
+      alert("PIN changed successfully!");
+    } catch (e) {
+      alert(e.message || "Could not change PIN.");
+    }
+  };
+  document.body.appendChild(backdrop);
 }
 
 // ---------------- home ----------------
@@ -127,12 +297,19 @@ async function renderHome() {
     return;
   }
   app.innerHTML = "";
+
+  const lockBtn = el(`<button class="icon-btn" title="Change Security PIN">&#9881;</button>`);
+  lockBtn.onclick = () => showChangePinModal();
+
+  const bar = topbar("Credit Ledger", { right: lockBtn });
+  app.appendChild(bar);
+
   const page = el(`
     <div class="page">
-      <div class="big-title">Credit Ledger</div>
-      <div class="subtitle">Choose a book</div>
+      <div class="subtitle">Select Product Line</div>
     </div>
   `);
+
   Object.entries(BOOKS).forEach(([key, meta]) => {
     const s = summary[key] || { total: 0, count: 0 };
     const card = el(`
@@ -152,6 +329,47 @@ async function renderHome() {
     };
     page.appendChild(card);
   });
+
+  const quickActions = el(`
+    <div class="quick-actions-section">
+      <div class="section-label" style="margin-top:24px">Quick Actions</div>
+      <button class="action-card-btn collection-btn">
+        <div class="icon">&#128221;</div>
+        <div class="info">
+          <div class="title">Daily Collection Entry</div>
+          <div class="desc">Record payments with retailer, product line & date</div>
+        </div>
+      </button>
+      <button class="action-card-btn report-btn" style="margin-top:12px">
+        <div class="icon">&#128200;</div>
+        <div class="info">
+          <div class="title">Monthly / Date Range Report</div>
+          <div class="desc">View, print & export Excel reports per product line</div>
+        </div>
+      </button>
+    </div>
+  `);
+
+  quickActions.querySelector(".collection-btn").onclick = () => {
+    state.collectionBook = "santhoor";
+    state.collectionRetailerId = null;
+    state.collectionDate = localISODate(new Date());
+    state.collectionAmount = "";
+    state.screen = "collectionEntry";
+    render();
+  };
+
+  quickActions.querySelector(".report-btn").onclick = () => {
+    state.reportBook = "santhoor";
+    const today = new Date();
+    const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+    state.reportFrom = localISODate(firstDay);
+    state.reportTo = localISODate(today);
+    state.screen = "monthlyReport";
+    render();
+  };
+
+  page.appendChild(quickActions);
   app.appendChild(page);
 }
 
@@ -172,13 +390,59 @@ async function renderList() {
     <div class="search-box">
       <span>&#128269;</span>
       <input id="searchInput" placeholder="Search retailer" value="${state.query}" />
+      <button type="button" id="searchMicBtn" style="background:none;border:none;font-size:22px;cursor:pointer;padding:4px;" title="Voice Search (Speak retailer name)">🎙️</button>
     </div>
   `);
-  searchBox.querySelector("#searchInput").oninput = (e) => {
+  const searchInput = searchBox.querySelector("#searchInput");
+  const searchMicBtn = searchBox.querySelector("#searchMicBtn");
+
+  searchInput.oninput = (e) => {
     state.query = e.target.value;
     renderRetailerRows(listBody);
   };
+
+  if (searchMicBtn) {
+    searchMicBtn.onclick = () => {
+      searchMicBtn.style.opacity = "0.5";
+      startSpeechToTextForName(
+        (text) => {
+          searchInput.value = text;
+          state.query = text;
+          searchMicBtn.style.opacity = "1";
+          renderRetailerRows(listBody);
+        },
+        (err) => {
+          searchMicBtn.style.opacity = "1";
+          alert(err || "Could not hear speech.");
+        }
+      );
+    };
+  }
+
   page.appendChild(searchBox);
+
+  const quickActionsRow = el(`
+    <div style="display:flex;gap:8px;margin-bottom:14px;">
+      <button class="secondary-btn" id="topPrintBtn" style="flex:1;padding:12px 6px;font-size:14px;margin:0;">&#128438; Print List</button>
+      <button class="secondary-btn" id="topReportBtn" style="flex:1;padding:12px 6px;font-size:14px;margin:0;">&#128200; Report</button>
+      <button class="secondary-btn" id="topImportBtn" style="flex:1;padding:12px 6px;font-size:14px;margin:0;">&#128196; Import</button>
+    </div>
+  `);
+
+  quickActionsRow.querySelector("#topPrintBtn").onclick = () => printBookList();
+  quickActionsRow.querySelector("#topReportBtn").onclick = () => {
+    state.reportBook = state.book;
+    const today = new Date();
+    const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+    state.reportFrom = localISODate(firstDay);
+    state.reportTo = localISODate(today);
+    state.screen = "monthlyReport";
+    render();
+  };
+  quickActionsRow.querySelector("#topImportBtn").onclick = () => showBulkImportModal();
+
+  page.appendChild(quickActionsRow);
+
   const listBody = el(`<div></div>`);
   page.appendChild(listBody);
   app.appendChild(page);
@@ -191,14 +455,6 @@ async function renderList() {
     return;
   }
   renderRetailerRows(listBody);
-
-  const printBtn = el(`<button class="secondary-btn">&#128438; Print This List</button>`);
-  printBtn.onclick = () => printBookList();
-  page.appendChild(printBtn);
-
-  const gridBtn = el(`<button class="secondary-btn">&#128203; Print Date-wise Sheet</button>`);
-  gridBtn.onclick = () => showDateRangeModal();
-  page.appendChild(gridBtn);
 
   const fab = el(`<button class="fab ${BOOKS[state.book].cls}">+ Add Retailer</button>`);
   fab.onclick = () => {
@@ -217,7 +473,7 @@ function renderRetailerRows(container) {
     container.appendChild(
       el(
         `<div class="empty-note">${
-          state.retailers.length === 0 ? "No retailers yet. Add one below." : "No match found."
+          state.retailers.length === 0 ? "No retailers associated with this product line." : "No match found."
         }</div>`
       )
     );
@@ -252,42 +508,121 @@ function renderAddRetailer() {
   const form = el(`
     <div>
       <div class="field">
-        <label>Shop name</label>
-        <input id="nameInput" placeholder="e.g. Ganesh Traders" autofocus />
+        <label>Shop Name</label>
+        <div style="position:relative;display:flex;align-items:center;">
+          <input id="nameInput" placeholder="e.g. Ganesh Traders" autofocus style="padding-right:48px;" />
+          <button type="button" id="nameMicBtn" style="position:absolute;right:8px;background:none;border:none;font-size:24px;padding:6px;cursor:pointer;" title="Voice input (Speak retailer name)">🎙️</button>
+        </div>
+        <div id="nameMicFeedback" class="hint" style="margin-top:4px;">Tap 🎙️ or keyboard mic to speak shop name</div>
       </div>
+
       <div class="field">
-        <label>Opening balance for ${BOOKS[state.book].label} (0 if none)</label>
-        <input id="openingInput" inputmode="numeric" placeholder="0" />
-        <div class="hint">This retailer will also appear in the other book with a balance of 0 — add that opening balance separately if needed.</div>
+        <label>Associated Product Lines</label>
+        <div class="checkbox-row" style="display:flex;gap:20px;margin-top:8px;">
+          <label style="display:flex;align-items:center;gap:8px;font-size:18px;font-weight:700;cursor:pointer;">
+            <input type="checkbox" id="chkSanthoor" checked style="width:22px;height:22px;" />
+            Santoor
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:18px;font-weight:700;cursor:pointer;">
+            <input type="checkbox" id="chkMtr" checked style="width:22px;height:22px;" />
+            MTR
+          </label>
+        </div>
       </div>
+
+      <div class="field" id="openingSanthoorGroup">
+        <label>Opening balance for Santoor (₹0 if none)</label>
+        <input id="openingSanthoor" inputmode="numeric" placeholder="0" />
+      </div>
+
+      <div class="field" id="openingMtrGroup">
+        <label>Opening balance for MTR (₹0 if none)</label>
+        <input id="openingMtr" inputmode="numeric" placeholder="0" />
+      </div>
+
       <button class="primary-btn ${BOOKS[state.book].cls}" id="saveBtn" disabled>Save Retailer</button>
+
+      <div class="import-btn-container">
+        <div style="font-size:14px;color:var(--ink-soft);margin-bottom:8px;">Have a list of retailers in Excel or JSON?</div>
+        <button type="button" class="secondary-btn" id="bulkImportBtn" style="margin-top:0;">📊 Import Retailers from Excel / JSON</button>
+      </div>
     </div>
   `);
+
   const nameInput = form.querySelector("#nameInput");
-  const openingInput = form.querySelector("#openingInput");
+  const chkSanthoor = form.querySelector("#chkSanthoor");
+  const chkMtr = form.querySelector("#chkMtr");
+  const openingSanthoor = form.querySelector("#openingSanthoor");
+  const openingMtr = form.querySelector("#openingMtr");
+  const openingSanthoorGroup = form.querySelector("#openingSanthoorGroup");
+  const openingMtrGroup = form.querySelector("#openingMtrGroup");
   const saveBtn = form.querySelector("#saveBtn");
 
-  const updateDisabled = () => {
-    saveBtn.disabled = !nameInput.value.trim();
+  const updateVisibility = () => {
+    openingSanthoorGroup.style.display = chkSanthoor.checked ? "block" : "none";
+    openingMtrGroup.style.display = chkMtr.checked ? "block" : "none";
+    saveBtn.disabled = !nameInput.value.trim() || (!chkSanthoor.checked && !chkMtr.checked);
   };
-  nameInput.oninput = updateDisabled;
-  openingInput.oninput = () => {
-    openingInput.value = openingInput.value.replace(/[^0-9]/g, "");
+
+  nameInput.oninput = updateVisibility;
+  chkSanthoor.onchange = updateVisibility;
+  chkMtr.onchange = updateVisibility;
+
+  const nameMicBtn = form.querySelector("#nameMicBtn");
+  const nameMicFeedback = form.querySelector("#nameMicFeedback");
+  if (nameMicBtn) {
+    nameMicBtn.onclick = () => {
+      nameMicFeedback.textContent = "Listening... Speak shop name now";
+      nameMicFeedback.style.color = "var(--santhoor)";
+      nameMicBtn.style.opacity = "0.5";
+
+      startSpeechToTextForName(
+        (text) => {
+          nameInput.value = text;
+          nameMicFeedback.textContent = "Recognized: " + text;
+          nameMicFeedback.style.color = "var(--ink-soft)";
+          nameMicBtn.style.opacity = "1";
+          updateVisibility();
+        },
+        (err) => {
+          nameMicFeedback.textContent = err || "Could not hear speech. Try typing.";
+          nameMicFeedback.style.color = "var(--due)";
+          nameMicBtn.style.opacity = "1";
+        }
+      );
+    };
+  }
+
+  openingSanthoor.oninput = () => {
+    openingSanthoor.value = openingSanthoor.value.replace(/[^0-9]/g, "");
+  };
+  openingMtr.oninput = () => {
+    openingMtr.value = openingMtr.value.replace(/[^0-9]/g, "");
   };
 
   saveBtn.onclick = async () => {
     saveBtn.disabled = true;
     try {
-      const payload = { name: nameInput.value.trim() };
-      payload["opening_" + state.book] = openingInput.value || 0;
+      const payload = {
+        name: nameInput.value.trim(),
+        has_santhoor: chkSanthoor.checked,
+        has_mtr: chkMtr.checked,
+        opening_santhoor: chkSanthoor.checked ? openingSanthoor.value || 0 : 0,
+        opening_mtr: chkMtr.checked ? openingMtr.value || 0 : 0,
+      };
       await api("/retailers", { method: "POST", body: JSON.stringify(payload) });
       state.screen = "list";
       render();
     } catch (e) {
-      alert("Could not save retailer. Try again.");
+      alert(e.message || "Could not save retailer. Try again.");
       saveBtn.disabled = false;
     }
   };
+
+  const bulkImportBtn = form.querySelector("#bulkImportBtn");
+  if (bulkImportBtn) {
+    bulkImportBtn.onclick = () => showBulkImportModal();
+  }
 
   const wrap = document.createDocumentFragment();
   wrap.appendChild(bar);
@@ -323,23 +658,25 @@ async function renderDetail() {
   app.innerHTML = "";
 
   const deleteBtn = el(`<button class="icon-btn">&#128465;</button>`);
-  deleteBtn.onclick = () => showConfirm({
-    title: "Delete this retailer?",
-    body: `${r.name} and all history (both books) will be removed.`,
-    danger: true,
-    confirmLabel: "Delete",
-    onConfirm: async () => {
-      try {
-        await api(`/retailers/${id}`, { method: "DELETE" });
-        hideConfirm();
-        state.screen = "list";
-        render();
-      } catch (e) {
-        hideConfirm();
-        alert("Could not delete. Try again.");
-      }
-    },
-  });
+  deleteBtn.onclick = () =>
+    showConfirm({
+      title: "Delete this retailer?",
+      body: `${r.name} and all transaction history will be removed.`,
+      danger: true,
+      confirmLabel: "Delete",
+      onConfirm: async () => {
+        try {
+          await api(`/retailers/${id}`, { method: "DELETE" });
+          hideConfirm();
+          state.screen = "list";
+          render();
+        } catch (e) {
+          hideConfirm();
+          alert("Could not delete. Try again.");
+        }
+      },
+    });
+
   app.appendChild(
     topbar(r.name, {
       back: () => {
@@ -351,12 +688,14 @@ async function renderDetail() {
   );
 
   const page = el(`<div class="page"></div>`);
-  page.appendChild(el(`
+  page.appendChild(
+    el(`
     <div class="balance-block">
       <div class="label">Current balance (${BOOKS[state.book].label})</div>
       <div class="amount ${r.balance > 0 ? "due" : "clear"}">${inr(r.balance)}</div>
     </div>
-  `));
+  `)
+  );
 
   const actions = el(`
     <div class="action-row">
@@ -381,7 +720,8 @@ async function renderDetail() {
     page.appendChild(el(`<div class="empty-note">No entries yet.</div>`));
   } else {
     r.history.forEach((h) => {
-      page.appendChild(el(`
+      page.appendChild(
+        el(`
         <div class="history-row">
           <div>
             <div class="date">${h.date}</div>
@@ -391,7 +731,8 @@ async function renderDetail() {
           </div>
           <div class="amt">${h.type === "purchase" ? "+" : "-"}${inr(h.amount)}</div>
         </div>
-      `));
+      `)
+      );
     });
   }
 
@@ -400,6 +741,344 @@ async function renderDetail() {
   page.appendChild(printBtn);
 
   app.appendChild(page);
+}
+
+// ---------------- daily collection entry ----------------
+
+async function renderCollectionEntry() {
+  app.innerHTML = "";
+  app.appendChild(
+    topbar("Daily Collection Entry", {
+      back: () => {
+        state.screen = "home";
+        render();
+      },
+    })
+  );
+
+  const page = el(`<div class="page"></div>`);
+
+  // Product Line Tabs
+  const tabs = el(`
+    <div class="product-line-tabs">
+      <button class="tab-btn ${state.collectionBook === "santhoor" ? "active santhoor" : ""}" id="tabSanthoor">Santoor</button>
+      <button class="tab-btn ${state.collectionBook === "mtr" ? "active mtr" : ""}" id="tabMtr">MTR</button>
+    </div>
+  `);
+
+  tabs.querySelector("#tabSanthoor").onclick = () => {
+    state.collectionBook = "santhoor";
+    state.collectionRetailerId = null;
+    renderCollectionEntry();
+  };
+  tabs.querySelector("#tabMtr").onclick = () => {
+    state.collectionBook = "mtr";
+    state.collectionRetailerId = null;
+    renderCollectionEntry();
+  };
+  page.appendChild(tabs);
+
+  // Form
+  const form = el(`
+    <div style="margin-top:16px;">
+      <div class="field">
+        <label>Retailer (${BOOKS[state.collectionBook].label})</label>
+        <select id="retailerSelect" style="width:100%;font-size:19px;padding:14px;border-radius:14px;border:2px solid var(--line);background:var(--white);outline:none;">
+          <option value="">Loading retailers…</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label>Collection Date</label>
+        <input type="date" id="collectionDateInput" value="${state.collectionDate || localISODate(new Date())}" />
+      </div>
+
+      <div class="field">
+        <label>Amount Collected (₹)</label>
+        <div style="position:relative;">
+          <input class="entry-input" id="collAmtInput" inputmode="numeric" placeholder="Enter amount" value="${state.collectionAmount || ""}" style="padding-right:54px;text-align:left;padding-left:18px;" />
+          <button id="micBtn" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;font-size:24px;padding:8px;border-radius:999px;cursor:pointer;" title="Voice input (Kannada/English)">🎙️</button>
+        </div>
+        <div id="speechFeedback" style="font-size:14px;color:var(--santhoor);margin-top:6px;min-height:20px;">
+          Tap 🎙️ or keyboard mic to speak amount
+        </div>
+      </div>
+
+      <button class="primary-btn ${BOOKS[state.collectionBook].cls}" id="saveCollBtn" disabled>Save Collection</button>
+    </div>
+  `);
+
+  const select = form.querySelector("#retailerSelect");
+  const dateInput = form.querySelector("#collectionDateInput");
+  const amtInput = form.querySelector("#collAmtInput");
+  const micBtn = form.querySelector("#micBtn");
+  const feedback = form.querySelector("#speechFeedback");
+  const saveBtn = form.querySelector("#saveCollBtn");
+
+  const updateSaveDisabled = () => {
+    const val = Number(amtInput.value);
+    saveBtn.disabled = !select.value || !val || val <= 0;
+  };
+
+  dateInput.onchange = (e) => {
+    state.collectionDate = e.target.value;
+  };
+  amtInput.oninput = () => {
+    amtInput.value = amtInput.value.replace(/[^0-9]/g, "");
+    state.collectionAmount = amtInput.value;
+    updateSaveDisabled();
+  };
+  select.onchange = () => {
+    state.collectionRetailerId = select.value;
+    updateSaveDisabled();
+  };
+
+  micBtn.onclick = () => {
+    feedback.textContent = "Listening... speak amount in Kannada or English";
+    micBtn.style.opacity = "0.5";
+    startSpeechToText(
+      (numberStr) => {
+        amtInput.value = numberStr;
+        state.collectionAmount = numberStr;
+        feedback.textContent = `Recognized amount: ₹${numberStr}`;
+        micBtn.style.opacity = "1";
+        updateSaveDisabled();
+      },
+      (err) => {
+        feedback.textContent = err || "Could not hear speech. Try keyboard mic.";
+        micBtn.style.opacity = "1";
+      }
+    );
+  };
+
+  saveBtn.onclick = async () => {
+    saveBtn.disabled = true;
+    try {
+      await api("/transactions", {
+        method: "POST",
+        body: JSON.stringify({
+          retailer_id: select.value,
+          book: state.collectionBook,
+          type: "payment",
+          amount: Number(amtInput.value),
+          date: dateInput.value,
+        }),
+      });
+      alert(`Collection of ₹${plainNum(amtInput.value)} saved successfully!`);
+      state.collectionAmount = "";
+      amtInput.value = "";
+      updateSaveDisabled();
+    } catch (e) {
+      alert(e.message || "Could not save entry.");
+      saveBtn.disabled = false;
+    }
+  };
+
+  page.appendChild(form);
+  app.appendChild(page);
+
+  try {
+    const retailers = await api("/retailers?book=" + state.collectionBook);
+    select.innerHTML = `<option value="">-- Select Retailer --</option>`;
+    retailers
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .forEach((r) => {
+        const opt = document.createElement("option");
+        opt.value = r.id;
+        opt.textContent = `${r.name} (Bal: ${inr(r.balance)})`;
+        if (state.collectionRetailerId && String(r.id) === String(state.collectionRetailerId)) {
+          opt.selected = true;
+        }
+        select.appendChild(opt);
+      });
+    updateSaveDisabled();
+  } catch (e) {
+    select.innerHTML = `<option value="">Could not load retailers</option>`;
+  }
+}
+
+// ---------------- monthly / date range report ----------------
+
+async function renderMonthlyReport() {
+  app.innerHTML = "";
+  app.appendChild(
+    topbar("Monthly / Range Report", {
+      back: () => {
+        state.screen = "home";
+        render();
+      },
+    })
+  );
+
+  const page = el(`<div class="page" style="padding-bottom:60px;"></div>`);
+
+  // Product Line Tabs
+  const tabs = el(`
+    <div class="product-line-tabs">
+      <button class="tab-btn ${state.reportBook === "santhoor" ? "active santhoor" : ""}" id="tabSanthoor">Santoor Report</button>
+      <button class="tab-btn ${state.reportBook === "mtr" ? "active mtr" : ""}" id="tabMtr">MTR Report</button>
+    </div>
+  `);
+
+  tabs.querySelector("#tabSanthoor").onclick = () => {
+    state.reportBook = "santhoor";
+    renderMonthlyReport();
+  };
+  tabs.querySelector("#tabMtr").onclick = () => {
+    state.reportBook = "mtr";
+    renderMonthlyReport();
+  };
+  page.appendChild(tabs);
+
+  // Filter Box
+  const today = new Date();
+  const defaultFrom = state.reportFrom || localISODate(new Date(today.getFullYear(), today.getMonth(), 1));
+  const defaultTo = state.reportTo || localISODate(today);
+
+  const filterBox = el(`
+    <div class="report-filter-box" style="margin-top:14px;background:var(--white);padding:16px;border-radius:16px;border:1px solid var(--line);">
+      <div class="preset-row" style="display:flex;gap:8px;margin-bottom:12px;overflow-x:auto;">
+        <button class="preset-btn" id="btnThisMonth">This Month</button>
+        <button class="preset-btn" id="btn7Days">Last 7 Days</button>
+        <button class="preset-btn" id="btn30Days">Last 30 Days</button>
+      </div>
+      <div class="date-range-row">
+        <div class="field">
+          <label>From Date</label>
+          <input type="date" id="repFrom" value="${defaultFrom}" />
+        </div>
+        <div class="field">
+          <label>To Date</label>
+          <input type="date" id="repTo" value="${defaultTo}" />
+        </div>
+      </div>
+      <button class="primary-btn ${BOOKS[state.reportBook].cls}" id="genReportBtn" style="padding:14px;font-size:18px;margin-top:8px;">
+        Generate Report
+      </button>
+    </div>
+  `);
+
+  filterBox.querySelector("#btnThisMonth").onclick = () => {
+    const f = new Date(today.getFullYear(), today.getMonth(), 1);
+    filterBox.querySelector("#repFrom").value = localISODate(f);
+    filterBox.querySelector("#repTo").value = localISODate(today);
+  };
+  filterBox.querySelector("#btn7Days").onclick = () => {
+    const f = new Date(today.getTime() - 6 * 24 * 60 * 60 * 1000);
+    filterBox.querySelector("#repFrom").value = localISODate(f);
+    filterBox.querySelector("#repTo").value = localISODate(today);
+  };
+  filterBox.querySelector("#btn30Days").onclick = () => {
+    const f = new Date(today.getTime() - 29 * 24 * 60 * 60 * 1000);
+    filterBox.querySelector("#repFrom").value = localISODate(f);
+    filterBox.querySelector("#repTo").value = localISODate(today);
+  };
+
+  const reportResults = el(`<div id="reportResults" style="margin-top:20px;"></div>`);
+  filterBox.querySelector("#genReportBtn").onclick = () => {
+    state.reportFrom = filterBox.querySelector("#repFrom").value;
+    state.reportTo = filterBox.querySelector("#repTo").value;
+    loadAndRenderReportGrid(reportResults);
+  };
+
+  page.appendChild(filterBox);
+  page.appendChild(reportResults);
+  app.appendChild(page);
+
+  state.reportFrom = defaultFrom;
+  state.reportTo = defaultTo;
+  loadAndRenderReportGrid(reportResults);
+}
+
+async function loadAndRenderReportGrid(container) {
+  container.innerHTML = `<div class="empty-note">Generating report…</div>`;
+  let data;
+  try {
+    data = await api(`/reports/grid?book=${state.reportBook}&from=${state.reportFrom}&to=${state.reportTo}`);
+  } catch (e) {
+    container.innerHTML = `<div class="empty-note">Could not load report: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+
+  container.innerHTML = "";
+
+  const actionRow = el(`
+    <div style="position:sticky;top:0;z-index:100;background:var(--paper);padding:10px 0 12px 0;margin-bottom:12px;display:flex;gap:10px;border-bottom:1px solid var(--line);">
+      <button class="secondary-btn" id="printReportBtn" style="flex:1;">&#128438; Print Report</button>
+      <button class="secondary-btn" id="excelReportBtn" style="flex:1;background:var(--clear);color:white;border-color:var(--clear);">&#128190; Export Excel</button>
+    </div>
+  `);
+
+  actionRow.querySelector("#printReportBtn").onclick = () => {
+    printGrid(data.from, data.to);
+  };
+  actionRow.querySelector("#excelReportBtn").onclick = () => {
+    window.location.href = `/api/reports/excel?book=${data.book}&from=${data.from}&to=${data.to}`;
+  };
+
+  container.appendChild(actionRow);
+
+  const stats = el(`
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px;">
+      <div class="stat-card" style="background:var(--white);padding:14px;border-radius:14px;border:1px solid var(--line);">
+        <div style="font-size:13px;color:var(--ink-soft);">Total Credit (Paid)</div>
+        <div style="font-size:22px;font-weight:800;color:var(--clear);margin-top:2px;">${inr(data.totals.grand_credit)}</div>
+      </div>
+      <div class="stat-card" style="background:var(--white);padding:14px;border-radius:14px;border:1px solid var(--line);">
+        <div style="font-size:13px;color:var(--ink-soft);">Total Debit (Billed)</div>
+        <div style="font-size:22px;font-weight:800;color:var(--due);margin-top:2px;">${inr(data.totals.grand_debit)}</div>
+      </div>
+      <div class="stat-card" style="background:var(--white);padding:14px;border-radius:14px;border:1px solid var(--line);">
+        <div style="font-size:13px;color:var(--ink-soft);">Net Outstanding</div>
+        <div style="font-size:22px;font-weight:800;color:${data.totals.grand_balance > 0 ? "var(--due)" : "var(--clear)"};margin-top:2px;">${inr(data.totals.grand_balance)}</div>
+      </div>
+    </div>
+  `);
+  container.appendChild(stats);
+
+  const rows = data.rows
+    .map((r) => `
+      <tr>
+        <td style="padding:10px 8px;font-weight:700;font-size:13px;white-space:nowrap;">${escapeHtml(r.name)}</td>
+        <td style="padding:10px 8px;text-align:center;font-size:13px;color:var(--ink-soft);">${r.credit_date}</td>
+        <td style="padding:10px 8px;text-align:right;font-weight:700;font-size:13px;color:var(--clear);">${r.credit_amount > 0 ? inr(r.credit_amount) : "-"}</td>
+        <td style="padding:10px 8px;text-align:center;font-size:13px;color:var(--ink-soft);">${r.debit_date}</td>
+        <td style="padding:10px 8px;text-align:right;font-weight:700;font-size:13px;color:var(--due);">${r.debit_amount > 0 ? inr(r.debit_amount) : "-"}</td>
+        <td style="padding:10px 8px;text-align:right;font-weight:800;font-size:13px;color:${r.balance > 0 ? "var(--due)" : "var(--clear)"};">${inr(r.balance)}</td>
+      </tr>
+    `)
+    .join("");
+
+  const tableCard = el(`
+    <div style="background:var(--white);border-radius:14px;border:1px solid var(--line);overflow-x:auto;">
+      <table style="width:100%;border-collapse:collapse;min-width:650px;">
+        <thead>
+          <tr style="background:var(--paper);border-bottom:2px solid var(--line);">
+            <th style="padding:10px 8px;text-align:left;font-size:13px;">Retailer Name</th>
+            <th style="padding:10px 8px;text-align:center;font-size:13px;">Credit Date</th>
+            <th style="padding:10px 8px;text-align:right;font-size:13px;color:var(--clear);">Credit (₹)</th>
+            <th style="padding:10px 8px;text-align:center;font-size:13px;">Debit Date</th>
+            <th style="padding:10px 8px;text-align:right;font-size:13px;color:var(--due);">Debit (₹)</th>
+            <th style="padding:10px 8px;text-align:right;font-size:13px;">Net Balance (₹)</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows || `<tr><td colspan="6" style="text-align:center;padding:20px;color:var(--ink-soft)">No retailers found for this product line</td></tr>`}
+        </tbody>
+        <tfoot>
+          <tr style="background:var(--paper);border-top:2px solid var(--line);">
+            <th style="padding:10px 8px;text-align:left;font-weight:800;">TOTAL</th>
+            <th style="padding:10px 8px;text-align:center;">-</th>
+            <th style="padding:10px 8px;text-align:right;font-weight:800;color:var(--clear);">${inr(data.totals.grand_credit)}</th>
+            <th style="padding:10px 8px;text-align:center;">-</th>
+            <th style="padding:10px 8px;text-align:right;font-weight:800;color:var(--due);">${inr(data.totals.grand_debit)}</th>
+            <th style="padding:10px 8px;text-align:right;font-weight:800;color:${data.totals.grand_balance > 0 ? "var(--due)" : "var(--clear)"};">${inr(data.totals.grand_balance)}</th>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  `);
+  container.appendChild(tableCard);
 }
 
 // ---------------- print ----------------
@@ -438,98 +1117,58 @@ function printRetailerStatement(r) {
   window.print();
 }
 
-function localISODate(d) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-
-function plainNum(n) {
-  return Number(n || 0).toLocaleString("en-IN", { maximumFractionDigits: 0 });
-}
-
-function showDateRangeModal() {
-  hideConfirm();
-  const today = new Date();
-  const weekAgo = new Date(today.getTime() - 6 * 24 * 60 * 60 * 1000);
-  const toStr = localISODate(today);
-  const fromStr = localISODate(weekAgo);
-
-  const backdrop = el(`
-    <div class="modal-backdrop" id="confirmBackdrop">
-      <div class="modal-card">
-        <div class="title">Print Date-wise Sheet</div>
-        <div class="body">Retailers as rows, dates as columns, balance at the end &mdash; like the ledger book. Max 45 days at a time.</div>
-        <div class="date-range-row">
-          <div class="field">
-            <label>From</label>
-            <input type="date" id="gridFrom" value="${fromStr}" />
-          </div>
-          <div class="field">
-            <label>To</label>
-            <input type="date" id="gridTo" value="${toStr}" />
-          </div>
-        </div>
-        <div class="modal-actions" style="margin-top:18px">
-          <button class="cancel">Cancel</button>
-          <button class="primary">Print</button>
-        </div>
-      </div>
-    </div>
-  `);
-  backdrop.querySelector(".cancel").onclick = hideConfirm;
-  backdrop.querySelector(".primary").onclick = async () => {
-    const from = backdrop.querySelector("#gridFrom").value;
-    const to = backdrop.querySelector("#gridTo").value;
-    if (!from || !to) return;
-    hideConfirm();
-    await printGrid(from, to);
-  };
-  document.body.appendChild(backdrop);
-}
-
 async function printGrid(from, to) {
   let data;
   try {
-    data = await api(`/grid?book=${state.book}&from=${from}&to=${to}`);
+    data = await api(`/reports/grid?book=${state.reportBook || state.book}&from=${from}&to=${to}`);
   } catch (e) {
     alert(e.message || "Could not load data for that range.");
     return;
   }
 
-  const dateHeaders = data.dates
-    .map((d) => {
-      const [, m, day] = d.split("-");
-      return `<th class="date-col">${day}/${m}</th>`;
-    })
-    .join("");
-
   const rows = data.rows
-    .map((r) => {
-      const cells = data.dates
-        .map((d) => {
-          const amt = r.entries[d];
-          return `<td class="date-cell">${amt ? plainNum(amt) : ""}</td>`;
-        })
-        .join("");
-      return `
+    .map(
+      (r) => `
         <tr>
-          <td class="name-cell">${escapeHtml(r.name)}</td>
-          ${cells}
-          <td class="balance-cell">${inr(r.balance)}</td>
-        </tr>`;
-    })
+          <td style="font-weight:700;">${escapeHtml(r.name)}</td>
+          <td style="text-align:center;">${r.credit_date}</td>
+          <td style="text-align:right;">${r.credit_amount > 0 ? inr(r.credit_amount) : "-"}</td>
+          <td style="text-align:center;">${r.debit_date}</td>
+          <td style="text-align:right;">${r.debit_amount > 0 ? inr(r.debit_amount) : "-"}</td>
+          <td style="text-align:right;font-weight:700;">${inr(r.balance)}</td>
+        </tr>`
+    )
     .join("");
 
   document.getElementById("printArea").innerHTML = `
     <div class="print-header">
-      <h2>${BOOKS[state.book].label} &mdash; Date-wise Sheet</h2>
-      <div class="meta">${from} to ${to} &middot; printed ${printDateStamp()}</div>
+      <h2>${BOOKS[data.book].label} &mdash; Credit & Debit Report</h2>
+      <div class="meta">Date Range: ${from} to ${to} &middot; Printed ${printDateStamp()}</div>
     </div>
-    <table class="print-table grid-table">
-      <thead><tr><th>Retailer</th>${dateHeaders}<th class="balance-col">Balance</th></tr></thead>
-      <tbody>${rows || `<tr><td colspan="${data.dates.length + 2}">No retailers</td></tr>`}</tbody>
+    <table class="print-table report-print-table">
+      <thead>
+        <tr>
+          <th style="width:30%;">Retailer Name</th>
+          <th style="width:14%;text-align:center;">Credit Date</th>
+          <th style="width:14%;text-align:right;">Credit (₹)</th>
+          <th style="width:14%;text-align:center;">Debit Date</th>
+          <th style="width:14%;text-align:right;">Debit (₹)</th>
+          <th style="width:14%;text-align:right;">Net Balance (₹)</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows || `<tr><td colspan="6" style="text-align:center;">No retailers found</td></tr>`}
+      </tbody>
+      <tfoot>
+        <tr style="font-weight:bold;background:#eee;">
+          <td>TOTAL</td>
+          <td style="text-align:center;">-</td>
+          <td style="text-align:right;">${inr(data.totals.grand_credit)}</td>
+          <td style="text-align:center;">-</td>
+          <td style="text-align:right;">${inr(data.totals.grand_debit)}</td>
+          <td style="text-align:right;">${inr(data.totals.grand_balance)}</td>
+        </tr>
+      </tfoot>
     </table>
   `;
   window.print();
@@ -562,7 +1201,7 @@ function printBookList() {
   window.print();
 }
 
-// ---------------- entry ----------------
+// ---------------- entry (single retailer view) ----------------
 
 function renderEntry() {
   const isPurchase = state.entryType === "purchase";
@@ -591,7 +1230,7 @@ function renderEntry() {
     saveBtn.disabled = !input.value || Number(input.value) <= 0;
   };
   body.appendChild(input);
-  body.appendChild(el(`<div class="mic-hint">Tap the mic on your keyboard to speak the amount in Kannada</div>`));
+  body.appendChild(el(`<div class="mic-hint">Tap the mic on your keyboard or speak the amount</div>`));
 
   const saveBtn = el(`<button class="primary-btn ${isPurchase ? "" : ""}" style="background:${isPurchase ? "#B3261E" : "#1B7A3D"}" disabled>Save Entry</button>`);
   saveBtn.onclick = async () => {
@@ -643,6 +1282,7 @@ function showConfirm(opts) {
   backdrop.querySelector(".danger").onclick = opts.onConfirm;
   document.body.appendChild(backdrop);
 }
+
 function hideConfirm() {
   const el = document.getElementById("confirmBackdrop");
   if (el) el.remove();
@@ -654,4 +1294,228 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 
+// ---------------- bulk import modal ----------------
+
+function showBulkImportModal() {
+  const backdrop = el(`
+    <div class="modal-backdrop" id="importBackdrop">
+      <div class="modal-card" style="max-width:520px;border-radius:20px;padding:24px;">
+        <div class="title" style="display:flex;justify-content:space-between;align-items:center;">
+          <span>Import Retailers</span>
+          <button id="closeImportModalBtn" style="background:none;border:none;font-size:24px;cursor:pointer;">&times;</button>
+        </div>
+        <div class="body" id="importModalBody" style="margin-top:14px;margin-bottom:14px;">
+          <p style="font-size:15px;color:var(--ink-soft);margin-bottom:16px;">
+            Upload an <strong>Excel (.xlsx)</strong> or <strong>JSON (.json)</strong> file with your retailer list.
+          </p>
+          <div class="import-dropzone" id="fileDropzone">
+            <div style="font-size:32px;margin-bottom:6px;">📄</div>
+            <div style="font-size:16px;font-weight:700;color:var(--ink);">Click or drag file to upload</div>
+            <div style="font-size:13px;color:var(--ink-soft);margin-top:4px;">Supports .xlsx or .json files</div>
+            <input type="file" id="bulkFileInput" accept=".xlsx,.xls,.json" style="display:none;" />
+          </div>
+          <div id="fileInfo" style="display:none;font-size:14px;font-weight:700;color:var(--santhoor);margin-bottom:12px;text-align:center;"></div>
+        </div>
+        <div class="modal-actions" id="importModalActions">
+          <button class="cancel" id="cancelImportBtn">Cancel</button>
+          <button class="primary" id="startImportBtn" disabled>Upload & Process</button>
+        </div>
+      </div>
+    </div>
+  `);
+
+  document.body.appendChild(backdrop);
+
+  const fileInput = backdrop.querySelector("#bulkFileInput");
+  const dropzone = backdrop.querySelector("#fileDropzone");
+  const fileInfo = backdrop.querySelector("#fileInfo");
+  const startBtn = backdrop.querySelector("#startImportBtn");
+  const cancelBtn = backdrop.querySelector("#cancelImportBtn");
+  const closeBtn = backdrop.querySelector("#closeImportModalBtn");
+
+  const close = () => backdrop.remove();
+  cancelBtn.onclick = close;
+  closeBtn.onclick = close;
+
+  dropzone.onclick = () => fileInput.click();
+
+  let selectedFile = null;
+  fileInput.onchange = (e) => {
+    if (e.target.files && e.target.files[0]) {
+      selectedFile = e.target.files[0];
+      fileInfo.textContent = `Selected: ${selectedFile.name} (${(selectedFile.size / 1024).toFixed(1)} KB)`;
+      fileInfo.style.display = "block";
+      startBtn.disabled = false;
+    }
+  };
+
+  startBtn.onclick = async () => {
+    if (!selectedFile) return;
+    startBtn.disabled = true;
+    startBtn.textContent = "Processing...";
+
+    const formData = new FormData();
+    formData.append("file", selectedFile);
+
+    try {
+      const res = await fetch("/api/retailers/bulk-import?confirm=1", {
+        method: "POST",
+        body: formData
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to process file.");
+      }
+
+      if (data.status === "mapping_required") {
+        renderMappingStep(data, selectedFile, backdrop);
+      } else {
+        renderSummaryStep(data, backdrop);
+      }
+    } catch (err) {
+      alert(err.message || "An error occurred during import.");
+      startBtn.disabled = false;
+      startBtn.textContent = "Upload & Process";
+    }
+  };
+}
+
+function renderMappingStep(data, file, backdrop) {
+  const cols = data.columns || [];
+  const sugg = data.suggested_mapping || {};
+  const modalBody = backdrop.querySelector("#importModalBody");
+  const modalActions = backdrop.querySelector("#importModalActions");
+
+  const optionsHtml = (selected) => {
+    return `<option value="">-- Ignore --</option>` + cols.map(c =>
+      `<option value="${escapeHtml(c)}" ${c === selected ? 'selected' : ''}>${escapeHtml(c)}</option>`
+    ).join('');
+  };
+
+  modalBody.innerHTML = `
+    <div style="font-size:15px;font-weight:700;margin-bottom:8px;color:var(--ink);">Confirm Header Mapping</div>
+    <p style="font-size:13px;color:var(--ink-soft);margin-bottom:12px;">
+      We detected the columns below. Please confirm which Excel columns correspond to retailer fields:
+    </p>
+    <table class="import-mapping-table">
+      <tr>
+        <td><strong>Retailer Name *</strong></td>
+        <td><select id="mapName">${optionsHtml(sugg.name)}</select></td>
+      </tr>
+      <tr>
+        <td>Santoor Line</td>
+        <td><select id="mapSanthoor">${optionsHtml(sugg.has_santhoor)}</select></td>
+      </tr>
+      <tr>
+        <td>MTR Line</td>
+        <td><select id="mapMtr">${optionsHtml(sugg.has_mtr)}</select></td>
+      </tr>
+      <tr>
+        <td>Opening Bal (Santoor)</td>
+        <td><select id="mapOpenSanthoor">${optionsHtml(sugg.opening_santhoor)}</select></td>
+      </tr>
+      <tr>
+        <td>Opening Bal (MTR)</td>
+        <td><select id="mapOpenMtr">${optionsHtml(sugg.opening_mtr)}</select></td>
+      </tr>
+    </table>
+  `;
+
+  modalActions.innerHTML = `
+    <button class="cancel" id="cancelMapBtn">Cancel</button>
+    <button class="primary" id="confirmMapBtn">Confirm & Import</button>
+  `;
+
+  backdrop.querySelector("#cancelMapBtn").onclick = () => backdrop.remove();
+  backdrop.querySelector("#confirmMapBtn").onclick = async () => {
+    const mapName = backdrop.querySelector("#mapName").value;
+    if (!mapName) {
+      alert("Please select a column for Retailer Name.");
+      return;
+    }
+
+    const mapping = {
+      name: mapName,
+      has_santhoor: backdrop.querySelector("#mapSanthoor").value,
+      has_mtr: backdrop.querySelector("#mapMtr").value,
+      opening_santhoor: backdrop.querySelector("#mapOpenSanthoor").value,
+      opening_mtr: backdrop.querySelector("#mapOpenMtr").value
+    };
+
+    const confirmBtn = backdrop.querySelector("#confirmMapBtn");
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = "Importing...";
+
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const res = await fetch("/api/retailers/bulk-import", {
+        method: "POST",
+        body: formData
+      });
+      const result = await res.json();
+      if (!res.ok) throw new Error(result.error || "Import failed");
+      renderSummaryStep(result, backdrop);
+    } catch (err) {
+      alert(err.message || "Failed to complete import.");
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = "Confirm & Import";
+    }
+  };
+}
+
+function renderSummaryStep(data, backdrop) {
+  const modalBody = backdrop.querySelector("#importModalBody");
+  const modalActions = backdrop.querySelector("#importModalActions");
+
+  const addedList = data.added || [];
+  const skippedList = data.skipped || [];
+
+  modalBody.innerHTML = `
+    <div style="text-align:center;margin-bottom:16px;">
+      <div style="font-size:38px;">🎉</div>
+      <div style="font-size:20px;font-weight:900;color:var(--ink);">Import Completed</div>
+    </div>
+
+    <div style="display:flex;gap:12px;margin-bottom:16px;">
+      <div style="flex:1;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:12px;padding:12px;text-align:center;">
+        <div style="font-size:24px;font-weight:900;color:#059669;">${data.added_count || 0}</div>
+        <div style="font-size:13px;font-weight:700;color:#047857;">Added</div>
+      </div>
+      <div style="flex:1;background:#fffbeb;border:1px solid #fde68a;border-radius:12px;padding:12px;text-align:center;">
+        <div style="font-size:24px;font-weight:900;color:#d97706;">${data.skipped_count || 0}</div>
+        <div style="font-size:13px;font-weight:700;color:#b45309;">Duplicates Skipped</div>
+      </div>
+    </div>
+
+    ${addedList.length > 0 ? `
+      <div style="font-size:13px;font-weight:700;color:var(--ink);margin-top:8px;">Added Retailers:</div>
+      <div class="import-summary-box">
+        ${addedList.map(name => `<div>✅ ${escapeHtml(name)}</div>`).join('')}
+      </div>
+    ` : ''}
+
+    ${skippedList.length > 0 ? `
+      <div style="font-size:13px;font-weight:700;color:var(--ink);margin-top:8px;">Skipped Duplicates:</div>
+      <div class="import-summary-box">
+        ${skippedList.map(name => `<div style="color:#b45309;">⚠️ ${escapeHtml(name)}</div>`).join('')}
+      </div>
+    ` : ''}
+  `;
+
+  modalActions.innerHTML = `
+    <button class="primary" id="finishImportBtn" style="width:100%;">Done</button>
+  `;
+
+  backdrop.querySelector("#finishImportBtn").onclick = () => {
+    backdrop.remove();
+    state.screen = "list";
+    render();
+  };
+}
+
 boot();
+
+
