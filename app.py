@@ -11,14 +11,24 @@ from models import db, Retailer, Transaction, Setting, BOOKS, IST, now_ist
 app = Flask(__name__, static_folder="static", static_url_path="")
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
-db_url = os.environ.get("DATABASE_URL", "sqlite:///ledger.db")
-# Render/Heroku-style postgres URLs sometimes start with postgres:// which
-# SQLAlchemy 1.4+ no longer accepts — normalize it.
-if db_url.startswith("postgres://"):
-    db_url = db_url.replace("postgres://", "postgresql://", 1)
+db_url = os.environ.get("DATABASE_URL")
+if db_url and db_url.strip():
+    db_url = db_url.strip()
+    # Render/Heroku-style postgres URLs sometimes start with postgres:// which
+    # SQLAlchemy 1.4+ no longer accepts — normalize it.
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+else:
+    db_url = "sqlite:///ledger.db"
+
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    "pool_pre_ping": True,
+    "pool_recycle": 280,
+}
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
+
 
 
 @app.after_request
@@ -350,11 +360,12 @@ def bulk_import_retailers():
                 "opening_mtr": detected_open_mtr_col or ""
             }
 
-    existing_retailers = Retailer.query.all()
-    existing_names_set = {r.name.strip().lower() for r in existing_retailers}
+    existing_rows = db.session.query(Retailer.name).all()
+    existing_names_set = {r[0].strip().lower() for r in existing_rows}
 
     added_list = []
     skipped_list = []
+    batch_pending = 0
 
     for row in rows_to_process:
         if isinstance(row, dict):
@@ -421,8 +432,17 @@ def bulk_import_retailers():
                         )
 
         added_list.append(raw_name)
+        batch_pending += 1
 
-    db.session.commit()
+        if batch_pending >= 50:
+            db.session.commit()
+            db.session.expunge_all()
+            batch_pending = 0
+
+    if batch_pending > 0:
+        db.session.commit()
+        db.session.expunge_all()
+
 
     return jsonify({
         "status": "success",
