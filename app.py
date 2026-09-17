@@ -3,6 +3,8 @@ import os
 from datetime import date, datetime, timedelta
 from functools import wraps
 
+from sqlalchemy import func, case
+
 # pyrefly: ignore [missing-import]
 from flask import Flask, jsonify, request, session, send_from_directory, send_file
 
@@ -28,7 +30,6 @@ app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
     "pool_recycle": 280,
 }
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
-
 
 
 @app.after_request
@@ -158,12 +159,43 @@ def session_check():
 @app.route("/api/summary")
 @login_required
 def summary():
+    """Returns total balance and retailer count for each book in a single aggregated query per book."""
     out = {}
     for book in BOOKS:
-        all_retailers = Retailer.query.all()
-        book_retailers = [r for r in all_retailers if r.is_in_book(book)]
-        total = round(sum(r.balance(book) for r in book_retailers), 2)
-        out[book] = {"total": total, "count": len(book_retailers)}
+        book_filter = Retailer.has_santhoor if book == "santhoor" else Retailer.has_mtr
+
+        tx_balance = func.coalesce(
+            func.sum(
+                case(
+                    (Transaction.type == "purchase", Transaction.amount),
+                    (Transaction.type == "payment", -Transaction.amount),
+                    else_=0.0,
+                )
+            ),
+            0.0,
+        )
+
+        subq = (
+            db.session.query(
+                Retailer.id,
+                tx_balance.label("retailer_balance"),
+            )
+            .outerjoin(
+                Transaction,
+                (Transaction.retailer_id == Retailer.id) & (Transaction.book == book),
+            )
+            .filter(book_filter == True)
+            .group_by(Retailer.id)
+            .subquery()
+        )
+
+        row = db.session.query(
+            func.count(subq.c.id),
+            func.coalesce(func.sum(subq.c.retailer_balance), 0.0),
+        ).one()
+
+        count, total = row
+        out[book] = {"total": round(float(total or 0.0), 2), "count": count}
     return jsonify(out)
 
 
@@ -173,13 +205,53 @@ def summary():
 @app.route("/api/retailers")
 @login_required
 def list_retailers():
+    """Returns all retailers in requested book with calculated balances using a single aggregated SQL query."""
     book = request.args.get("book", "santhoor")
     if not valid_book(book):
         return jsonify({"error": "invalid book"}), 400
 
-    all_retailers = Retailer.query.order_by(Retailer.name.asc()).all()
-    book_retailers = [r for r in all_retailers if r.is_in_book(book)]
-    return jsonify([r.to_summary_dict(book) for r in book_retailers])
+    book_filter = Retailer.has_santhoor if book == "santhoor" else Retailer.has_mtr
+
+    tx_balance = func.coalesce(
+        func.sum(
+            case(
+                (Transaction.type == "purchase", Transaction.amount),
+                (Transaction.type == "payment", -Transaction.amount),
+                else_=0.0,
+            )
+        ),
+        0.0,
+    )
+
+    results = (
+        db.session.query(
+            Retailer.id,
+            Retailer.name,
+            Retailer.has_santhoor,
+            Retailer.has_mtr,
+            tx_balance.label("balance"),
+        )
+        .outerjoin(
+            Transaction,
+            (Transaction.retailer_id == Retailer.id) & (Transaction.book == book),
+        )
+        .filter(book_filter == True)
+        .group_by(Retailer.id, Retailer.name, Retailer.has_santhoor, Retailer.has_mtr)
+        .order_by(Retailer.name.asc())
+        .all()
+    )
+
+    out = [
+        {
+            "id": r_id,
+            "name": name,
+            "has_santhoor": s_flag,
+            "has_mtr": m_flag,
+            "balance": round(float(bal or 0.0), 2),
+        }
+        for r_id, name, s_flag, m_flag, bal in results
+    ]
+    return jsonify(out)
 
 
 @app.route("/api/retailers", methods=["POST"])
@@ -503,13 +575,6 @@ def create_transaction():
 # ---------------- Reports Grid & Export ----------------
 
 
-def build_report_data(book, from_str, to_str):
-    if not valid_book(book):
-        raise ValueError("Invalid book")
-
-    today = date.today()
-    default_from = today - timedelta(days=6)
-    from_str = from_str or default_from.isoformat()
 def build_report_data(book, from_str=None, to_str=None):
     if not valid_book(book):
         raise ValueError("invalid book")
@@ -525,8 +590,41 @@ def build_report_data(book, from_str=None, to_str=None):
     else:
         d_to = today
 
-    all_retailers = Retailer.query.order_by(Retailer.name.asc()).all()
-    retailers = [r for r in all_retailers if r.is_in_book(book)]
+    book_filter = Retailer.has_santhoor if book == "santhoor" else Retailer.has_mtr
+
+    # Fetch all relevant retailers in 1 single query
+    retailers = (
+        Retailer.query.filter(book_filter == True)
+        .order_by(Retailer.name.asc())
+        .all()
+    )
+    if not retailers:
+        return {
+            "book": book,
+            "from": d_from.isoformat(),
+            "to": d_to.isoformat(),
+            "rows": [],
+            "totals": {"grand_credit": 0.0, "grand_debit": 0.0, "grand_balance": 0.0},
+        }
+
+    retailer_ids = [r.id for r in retailers]
+
+    # Fetch ALL transactions up to d_to for this book in 1 single query
+    dt_to_end = datetime.combine(d_to, datetime.max.time())
+    all_txs = (
+        Transaction.query.filter(
+            Transaction.book == book,
+            Transaction.retailer_id.in_(retailer_ids),
+            Transaction.created_at <= dt_to_end,
+        )
+        .order_by(Transaction.created_at.asc())
+        .all()
+    )
+
+    # Group transactions by retailer_id in memory
+    txs_by_retailer = {r_id: [] for r_id in retailer_ids}
+    for t in all_txs:
+        txs_by_retailer[t.retailer_id].append(t)
 
     rows = []
     grand_credit = 0.0
@@ -534,14 +632,17 @@ def build_report_data(book, from_str=None, to_str=None):
     grand_balance = 0.0
 
     for r in retailers:
-        # Filter transactions in range for this book
-        txs = [
-            t for t in r.transactions
-            if t.book == book and d_from <= t.created_at.date() <= d_to
-        ]
+        r_txs = txs_by_retailer.get(r.id, [])
 
-        payments = [t for t in txs if t.type == "payment"]
-        purchases = [t for t in txs if t.type == "purchase"]
+        # Balance up to d_to
+        rem_balance = round(
+            sum(t.amount if t.type == "purchase" else -t.amount for t in r_txs), 2
+        )
+
+        # Transactions in date range [d_from, d_to]
+        range_txs = [t for t in r_txs if t.created_at.date() >= d_from]
+        payments = [t for t in range_txs if t.type == "payment"]
+        purchases = [t for t in range_txs if t.type == "purchase"]
 
         credit_total = round(sum(t.amount for t in payments), 2)
         last_credit = max((t.created_at for t in payments), default=None)
@@ -550,8 +651,6 @@ def build_report_data(book, from_str=None, to_str=None):
         debit_total = round(sum(t.amount for t in purchases), 2)
         last_debit = max((t.created_at for t in purchases), default=None)
         debit_date_str = last_debit.strftime("%d %b %Y") if last_debit else "-"
-
-        rem_balance = r.balance(book, date_to=d_to)
 
         grand_credit = round(grand_credit + credit_total, 2)
         grand_debit = round(grand_debit + debit_total, 2)
@@ -580,6 +679,7 @@ def build_report_data(book, from_str=None, to_str=None):
         "rows": rows,
         "totals": totals
     }
+
 
 
 @app.route("/api/reports/grid")
