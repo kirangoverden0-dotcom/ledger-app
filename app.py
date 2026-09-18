@@ -314,10 +314,40 @@ def get_retailer(retailer_id):
     )
 
 
+@app.route("/api/retailers/<int:retailer_id>", methods=["PUT"])
+@login_required
+def update_retailer(retailer_id):
+    r = Retailer.query.get_or_404(retailer_id)
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+
+    has_santhoor = bool(data.get("has_santhoor", r.has_santhoor))
+    has_mtr = bool(data.get("has_mtr", r.has_mtr))
+
+    if not has_santhoor and not has_mtr:
+        return jsonify({"error": "Retailer must belong to at least one product line"}), 400
+
+    r.name = name
+    r.has_santhoor = has_santhoor
+    r.has_mtr = has_mtr
+    db.session.commit()
+    return jsonify({"id": r.id, "name": r.name, "has_santhoor": r.has_santhoor, "has_mtr": r.has_mtr})
+
+
 @app.route("/api/retailers/<int:retailer_id>", methods=["DELETE"])
 @login_required
 def delete_retailer(retailer_id):
     r = Retailer.query.get_or_404(retailer_id)
+    tx_count = Transaction.query.filter_by(retailer_id=r.id).count()
+    if tx_count > 0:
+        return jsonify({
+            "error": f"Cannot delete '{r.name}' because they have {tx_count} transaction record(s). Deletion blocked to preserve transaction history.",
+            "has_history": True,
+            "tx_count": tx_count
+        }), 400
+
     db.session.delete(r)
     db.session.commit()
     return jsonify({"ok": True})
@@ -646,11 +676,11 @@ def build_report_data(book, from_str=None, to_str=None):
 
         credit_total = round(sum(t.amount for t in payments), 2)
         last_credit = max((t.created_at for t in payments), default=None)
-        credit_date_str = last_credit.strftime("%d %b %Y") if last_credit else "-"
+        credit_date_str = last_credit.strftime("%d %b") if last_credit else "-"
 
         debit_total = round(sum(t.amount for t in purchases), 2)
         last_debit = max((t.created_at for t in purchases), default=None)
-        debit_date_str = last_debit.strftime("%d %b %Y") if last_debit else "-"
+        debit_date_str = last_debit.strftime("%d %b") if last_debit else "-"
 
         grand_credit = round(grand_credit + credit_total, 2)
         grand_debit = round(grand_debit + debit_total, 2)

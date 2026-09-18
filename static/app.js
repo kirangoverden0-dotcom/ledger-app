@@ -285,6 +285,220 @@ function showChangePinModal() {
   document.body.appendChild(backdrop);
 }
 
+function addLongPressListener(element, onLongPress, onClick) {
+  let timer = null;
+  let isLongPress = false;
+  let startX = 0;
+  let startY = 0;
+
+  const start = (e) => {
+    isLongPress = false;
+    const touch = e.touches ? e.touches[0] : e;
+    startX = touch.clientX;
+    startY = touch.clientY;
+    timer = setTimeout(() => {
+      isLongPress = true;
+      if (navigator.vibrate) navigator.vibrate(40);
+      onLongPress(e);
+    }, 500);
+  };
+
+  const cancel = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+
+  const move = (e) => {
+    if (!timer) return;
+    const touch = e.touches ? e.touches[0] : e;
+    if (Math.abs(touch.clientX - startX) > 10 || Math.abs(touch.clientY - startY) > 10) {
+      cancel();
+    }
+  };
+
+  const end = (e) => {
+    const wasLongPress = isLongPress;
+    cancel();
+    if (wasLongPress) {
+      e.preventDefault();
+      e.stopPropagation();
+    } else if (onClick) {
+      onClick(e);
+    }
+  };
+
+  element.addEventListener("touchstart", start, { passive: true });
+  element.addEventListener("touchend", end);
+  element.addEventListener("touchmove", move, { passive: true });
+  element.addEventListener("touchcancel", cancel);
+
+  element.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    start(e);
+  });
+  element.addEventListener("mouseup", end);
+  element.addEventListener("mouseleave", cancel);
+  element.addEventListener("mousemove", move);
+
+  element.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+  });
+}
+
+function showRetailerOptionsMenu(retailer) {
+  hideConfirm();
+  const backdrop = el(`
+    <div class="modal-backdrop" id="confirmBackdrop">
+      <div class="modal-card">
+        <div class="title">${escapeHtml(retailer.name)}</div>
+        <div class="body" style="margin-bottom:16px;font-size:15px;">Options for retailer</div>
+        <button class="context-menu-btn" id="menuEditBtn">
+          <span>✏️</span> <span>Edit Retailer</span>
+        </button>
+        <button class="context-menu-btn danger" id="menuDeleteBtn">
+          <span>🗑️</span> <span>Delete Retailer</span>
+        </button>
+        <div class="modal-actions" style="margin-top:16px;">
+          <button class="cancel">Cancel</button>
+        </div>
+      </div>
+    </div>
+  `);
+
+  backdrop.querySelector(".cancel").onclick = hideConfirm;
+  backdrop.querySelector("#menuEditBtn").onclick = () => {
+    hideConfirm();
+    showEditRetailerModal(retailer);
+  };
+  backdrop.querySelector("#menuDeleteBtn").onclick = () => {
+    hideConfirm();
+    handleDeleteRetailer(retailer);
+  };
+
+  document.body.appendChild(backdrop);
+}
+
+function showEditRetailerModal(retailer) {
+  hideConfirm();
+  const backdrop = el(`
+    <div class="modal-backdrop" id="confirmBackdrop">
+      <div class="modal-card">
+        <div class="title">Edit Retailer</div>
+        <div class="field" style="margin-top:14px;">
+          <label>Shop Name</label>
+          <input id="editNameInput" value="${escapeHtml(retailer.name)}" autofocus />
+        </div>
+        <div class="field">
+          <label>Associated Product Lines</label>
+          <div style="display:flex;gap:20px;margin-top:8px;">
+            <label style="display:flex;align-items:center;gap:8px;font-size:18px;font-weight:700;cursor:pointer;">
+              <input type="checkbox" id="editChkSanthoor" ${retailer.has_santhoor ? "checked" : ""} style="width:22px;height:22px;" />
+              Santoor
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:18px;font-weight:700;cursor:pointer;">
+              <input type="checkbox" id="editChkMtr" ${retailer.has_mtr ? "checked" : ""} style="width:22px;height:22px;" />
+              MTR
+            </label>
+          </div>
+        </div>
+        <div class="modal-actions" style="margin-top:18px;">
+          <button class="cancel">Cancel</button>
+          <button class="primary" id="saveEditBtn">Save Changes</button>
+        </div>
+      </div>
+    </div>
+  `);
+
+  const nameInput = backdrop.querySelector("#editNameInput");
+  const chkSanthoor = backdrop.querySelector("#editChkSanthoor");
+  const chkMtr = backdrop.querySelector("#editChkMtr");
+  const saveBtn = backdrop.querySelector("#saveEditBtn");
+
+  backdrop.querySelector(".cancel").onclick = hideConfirm;
+
+  saveBtn.onclick = async () => {
+    const name = nameInput.value.trim();
+    if (!name) {
+      alert("Shop name required");
+      return;
+    }
+    if (!chkSanthoor.checked && !chkMtr.checked) {
+      alert("Retailer must belong to at least one product line");
+      return;
+    }
+
+    saveBtn.disabled = true;
+    try {
+      await api(`/retailers/${retailer.id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          name,
+          has_santhoor: chkSanthoor.checked,
+          has_mtr: chkMtr.checked,
+        }),
+      });
+      hideConfirm();
+      if (state.screen === "list") {
+        state.retailers = await api("/retailers?book=" + state.book);
+        renderList();
+      } else {
+        render();
+      }
+    } catch (e) {
+      alert(e.message || "Could not update retailer");
+      saveBtn.disabled = false;
+    }
+  };
+
+  document.body.appendChild(backdrop);
+}
+
+function handleDeleteRetailer(retailer) {
+  showConfirm({
+    title: `Delete ${retailer.name}?`,
+    body: "Are you sure you want to delete this retailer?",
+    danger: true,
+    confirmLabel: "Delete",
+    onConfirm: async () => {
+      try {
+        await api(`/retailers/${retailer.id}`, { method: "DELETE" });
+        hideConfirm();
+        if (state.screen === "detail") {
+          state.screen = "list";
+        } else if (state.screen === "list") {
+          state.retailers = await api("/retailers?book=" + state.book);
+        }
+        render();
+      } catch (e) {
+        hideConfirm();
+        showWarningModal({
+          title: "⚠️ Cannot Delete Retailer",
+          body: e.message || `Cannot delete '${retailer.name}' because they have transaction history. Deletion blocked to preserve transaction records.`,
+        });
+      }
+    },
+  });
+}
+
+function showWarningModal(opts) {
+  hideConfirm();
+  const backdrop = el(`
+    <div class="modal-backdrop" id="confirmBackdrop">
+      <div class="modal-card">
+        <div class="title" style="color:var(--due);">${opts.title}</div>
+        <div class="body" style="margin-top:10px;margin-bottom:20px;line-height:1.4;">${escapeHtml(opts.body)}</div>
+        <div class="modal-actions">
+          <button class="primary" style="background:var(--ink);" id="closeWarningBtn">OK, Got It</button>
+        </div>
+      </div>
+    </div>
+  `);
+  backdrop.querySelector("#closeWarningBtn").onclick = hideConfirm;
+  document.body.appendChild(backdrop);
+}
+
 // ---------------- home ----------------
 
 async function renderHome() {
@@ -486,11 +700,15 @@ function renderRetailerRows(container) {
         <span class="amt ${r.balance > 0 ? "due" : "clear"}">${r.balance > 0 ? inr(r.balance) : "Cleared"}</span>
       </button>
     `);
-    row.onclick = () => {
-      state.activeRetailer = { id: r.id };
-      state.screen = "detail";
-      render();
-    };
+    addLongPressListener(
+      row,
+      () => showRetailerOptionsMenu(r),
+      () => {
+        state.activeRetailer = { id: r.id };
+        state.screen = "detail";
+        render();
+      }
+    );
     container.appendChild(row);
   });
 }
@@ -658,24 +876,7 @@ async function renderDetail() {
   app.innerHTML = "";
 
   const deleteBtn = el(`<button class="icon-btn">&#128465;</button>`);
-  deleteBtn.onclick = () =>
-    showConfirm({
-      title: "Delete this retailer?",
-      body: `${r.name} and all transaction history will be removed.`,
-      danger: true,
-      confirmLabel: "Delete",
-      onConfirm: async () => {
-        try {
-          await api(`/retailers/${id}`, { method: "DELETE" });
-          hideConfirm();
-          state.screen = "list";
-          render();
-        } catch (e) {
-          hideConfirm();
-          alert("Could not delete. Try again.");
-        }
-      },
-    });
+  deleteBtn.onclick = () => handleDeleteRetailer(r);
 
   app.appendChild(
     topbar(r.name, {
@@ -783,9 +984,13 @@ async function renderCollectionEntry() {
     <div style="margin-top:16px;">
       <div class="field">
         <label>Retailer (${BOOKS[state.collectionBook].label})</label>
-        <select id="retailerSelect" style="width:100%;font-size:19px;padding:14px;border-radius:14px;border:2px solid var(--line);background:var(--white);outline:none;">
-          <option value="">Loading retailers…</option>
-        </select>
+        <div class="searchable-select-wrap" id="retailerSearchWrap">
+          <div class="searchable-select-box">
+            <input type="text" class="searchable-select-input" id="retailerSearchInput" placeholder="Type retailer name to search..." autocomplete="off" />
+            <button type="button" class="searchable-clear-btn" id="retailerClearBtn" style="display:none;" title="Clear selection">✕</button>
+          </div>
+          <div class="searchable-dropdown-list" id="retailerDropdownList" style="display:none;"></div>
+        </div>
       </div>
 
       <div class="field">
@@ -808,28 +1013,94 @@ async function renderCollectionEntry() {
     </div>
   `);
 
-  const select = form.querySelector("#retailerSelect");
+  const searchInput = form.querySelector("#retailerSearchInput");
+  const clearBtn = form.querySelector("#retailerClearBtn");
+  const dropdownList = form.querySelector("#retailerDropdownList");
   const dateInput = form.querySelector("#collectionDateInput");
   const amtInput = form.querySelector("#collAmtInput");
   const micBtn = form.querySelector("#micBtn");
   const feedback = form.querySelector("#speechFeedback");
   const saveBtn = form.querySelector("#saveCollBtn");
 
+  let fetchedRetailers = [];
+
   const updateSaveDisabled = () => {
     const val = Number(amtInput.value);
-    saveBtn.disabled = !select.value || !val || val <= 0;
+    saveBtn.disabled = !state.collectionRetailerId || !val || val <= 0;
   };
+
+  const renderDropdownItems = (filterQuery) => {
+    dropdownList.innerHTML = "";
+    const q = filterQuery.trim().toLowerCase();
+    const matches = fetchedRetailers.filter((r) => r.name.toLowerCase().includes(q));
+
+    if (matches.length === 0) {
+      dropdownList.innerHTML = `<div class="searchable-empty">No matching retailer found</div>`;
+    } else {
+      matches.forEach((r) => {
+        const item = el(`
+          <div class="searchable-item ${String(r.id) === String(state.collectionRetailerId) ? "selected" : ""}">
+            <span>${escapeHtml(r.name)}</span>
+            <span class="item-bal ${r.balance > 0 ? "due" : "clear"}">${r.balance > 0 ? inr(r.balance) : "Cleared"}</span>
+          </div>
+        `);
+        item.onmousedown = (e) => {
+          e.preventDefault();
+          selectRetailer(r);
+        };
+        dropdownList.appendChild(item);
+      });
+    }
+  };
+
+  const selectRetailer = (r) => {
+    if (r) {
+      state.collectionRetailerId = r.id;
+      searchInput.value = `${r.name} (Bal: ${r.balance > 0 ? inr(r.balance) : "Cleared"})`;
+      clearBtn.style.display = "block";
+    } else {
+      state.collectionRetailerId = null;
+      searchInput.value = "";
+      clearBtn.style.display = "none";
+    }
+    dropdownList.style.display = "none";
+    updateSaveDisabled();
+  };
+
+  searchInput.onfocus = () => {
+    dropdownList.style.display = "block";
+    const q = state.collectionRetailerId ? "" : searchInput.value;
+    renderDropdownItems(q);
+  };
+
+  searchInput.oninput = () => {
+    state.collectionRetailerId = null;
+    clearBtn.style.display = searchInput.value ? "block" : "none";
+    dropdownList.style.display = "block";
+    renderDropdownItems(searchInput.value);
+    updateSaveDisabled();
+  };
+
+  clearBtn.onclick = () => {
+    selectRetailer(null);
+    searchInput.focus();
+    dropdownList.style.display = "block";
+    renderDropdownItems("");
+  };
+
+  document.addEventListener("click", function closeDropdown(e) {
+    if (!form.contains(e.target)) {
+      dropdownList.style.display = "none";
+    }
+  });
 
   dateInput.onchange = (e) => {
     state.collectionDate = e.target.value;
   };
+
   amtInput.oninput = () => {
     amtInput.value = amtInput.value.replace(/[^0-9]/g, "");
     state.collectionAmount = amtInput.value;
-    updateSaveDisabled();
-  };
-  select.onchange = () => {
-    state.collectionRetailerId = select.value;
     updateSaveDisabled();
   };
 
@@ -852,12 +1123,13 @@ async function renderCollectionEntry() {
   };
 
   saveBtn.onclick = async () => {
+    if (!state.collectionRetailerId) return;
     saveBtn.disabled = true;
     try {
       await api("/transactions", {
         method: "POST",
         body: JSON.stringify({
-          retailer_id: select.value,
+          retailer_id: state.collectionRetailerId,
           book: state.collectionBook,
           type: "payment",
           amount: Number(amtInput.value),
@@ -879,21 +1151,13 @@ async function renderCollectionEntry() {
 
   try {
     const retailers = await api("/retailers?book=" + state.collectionBook);
-    select.innerHTML = `<option value="">-- Select Retailer --</option>`;
-    retailers
-      .sort((a, b) => a.name.localeCompare(b.name))
-      .forEach((r) => {
-        const opt = document.createElement("option");
-        opt.value = r.id;
-        opt.textContent = `${r.name} (Bal: ${inr(r.balance)})`;
-        if (state.collectionRetailerId && String(r.id) === String(state.collectionRetailerId)) {
-          opt.selected = true;
-        }
-        select.appendChild(opt);
-      });
-    updateSaveDisabled();
+    fetchedRetailers = retailers.sort((a, b) => a.name.localeCompare(b.name));
+    if (state.collectionRetailerId) {
+      const match = fetchedRetailers.find((r) => String(r.id) === String(state.collectionRetailerId));
+      if (match) selectRetailer(match);
+    }
   } catch (e) {
-    select.innerHTML = `<option value="">Could not load retailers</option>`;
+    searchInput.placeholder = "Could not load retailers";
   }
 }
 
@@ -1050,8 +1314,8 @@ async function loadAndRenderReportGrid(container) {
     .join("");
 
   const tableCard = el(`
-    <div style="background:var(--white);border-radius:14px;border:1px solid var(--line);overflow-x:auto;">
-      <table style="width:100%;border-collapse:collapse;min-width:650px;">
+    <div class="report-table-wrap">
+      <table class="report-table">
         <thead>
           <tr style="background:var(--paper);border-bottom:2px solid var(--line);">
             <th style="padding:10px 8px;text-align:left;font-size:13px;">Retailer Name</th>
