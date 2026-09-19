@@ -182,7 +182,7 @@ def summary():
             )
             .outerjoin(
                 Transaction,
-                (Transaction.retailer_id == Retailer.id) & (Transaction.book == book),
+                (Transaction.retailer_id == Retailer.id) & (Transaction.book == book) & (Transaction.is_archived == False),
             )
             .filter(book_filter == True)
             .group_by(Retailer.id)
@@ -233,7 +233,7 @@ def list_retailers():
         )
         .outerjoin(
             Transaction,
-            (Transaction.retailer_id == Retailer.id) & (Transaction.book == book),
+            (Transaction.retailer_id == Retailer.id) & (Transaction.book == book) & (Transaction.is_archived == False),
         )
         .filter(book_filter == True)
         .group_by(Retailer.id, Retailer.name, Retailer.has_santhoor, Retailer.has_mtr)
@@ -309,6 +309,7 @@ def get_retailer(retailer_id):
             "has_santhoor": r.has_santhoor,
             "has_mtr": r.has_mtr,
             "balance": r.balance(book),
+            "has_archived": r.has_archived(book),
             "history": r.history(book),
         }
     )
@@ -351,6 +352,52 @@ def delete_retailer(retailer_id):
     db.session.delete(r)
     db.session.commit()
     return jsonify({"ok": True})
+
+
+@app.route("/api/retailers/<int:retailer_id>/clear", methods=["POST"])
+@login_required
+def clear_retailer_history(retailer_id):
+    r = Retailer.query.get_or_404(retailer_id)
+    book = request.args.get("book")
+    query = Transaction.query.filter_by(retailer_id=r.id, is_archived=False)
+    if book and valid_book(book):
+        query = query.filter_by(book=book)
+
+    txs = query.all()
+    for t in txs:
+        t.is_archived = True
+    db.session.commit()
+
+    res_book = book if (book and valid_book(book)) else "santhoor"
+    return jsonify({
+        "ok": True,
+        "archived_count": len(txs),
+        "balance": r.balance(res_book),
+        "has_archived": r.has_archived(res_book)
+    })
+
+
+@app.route("/api/retailers/<int:retailer_id>/restore", methods=["POST"])
+@login_required
+def restore_retailer_history(retailer_id):
+    r = Retailer.query.get_or_404(retailer_id)
+    book = request.args.get("book")
+    query = Transaction.query.filter_by(retailer_id=r.id, is_archived=True)
+    if book and valid_book(book):
+        query = query.filter_by(book=book)
+
+    txs = query.all()
+    for t in txs:
+        t.is_archived = False
+    db.session.commit()
+
+    res_book = book if (book and valid_book(book)) else "santhoor"
+    return jsonify({
+        "ok": True,
+        "restored_count": len(txs),
+        "balance": r.balance(res_book),
+        "has_archived": r.has_archived(res_book)
+    })
 
 
 @app.route("/api/retailers/bulk-import", methods=["POST"])
@@ -641,15 +688,16 @@ def build_report_data(book, from_str=None, to_str=None):
 
     retailer_ids = [r.id for r in retailers]
 
-    # Fetch ALL transactions up to d_to for this book in 1 single query
+    # Fetch ALL non-archived transactions up to d_to for this book in 1 single query
     dt_to_end = datetime.combine(d_to, datetime.max.time())
     all_txs = (
         Transaction.query.filter(
             Transaction.book == book,
             Transaction.retailer_id.in_(retailer_ids),
+            Transaction.is_archived == False,
             Transaction.created_at <= dt_to_end,
         )
-        .order_by(Transaction.created_at.asc())
+        .order_by(Transaction.created_at.asc(), Transaction.id.asc())
         .all()
     )
 
@@ -671,6 +719,10 @@ def build_report_data(book, from_str=None, to_str=None):
             sum(t.amount if t.type == "purchase" else -t.amount for t in r_txs), 2
         )
 
+        # Sequential bill numbers for all active purchases up to dt_to_end
+        all_purchases_chrono = [t for t in r_txs if t.type == "purchase"]
+        bill_num_map = {t.id: idx + 1 for idx, t in enumerate(all_purchases_chrono)}
+
         # Transactions in date range [d_from, d_to]
         range_txs = [t for t in r_txs if t.created_at.date() >= d_from]
         payments = [t for t in range_txs if t.type == "payment"]
@@ -681,8 +733,18 @@ def build_report_data(book, from_str=None, to_str=None):
         credit_date_str = last_credit.strftime("%d %b") if last_credit else "-"
 
         debit_total = round(sum(t.amount for t in purchases), 2)
-        last_debit = max((t.created_at for t in purchases), default=None)
-        debit_date_str = last_debit.strftime("%d %b") if last_debit else "-"
+        if purchases:
+            dates_grouped = {}
+            for t in purchases:
+                d_str = t.created_at.strftime("%d %b")
+                b_num = f"Bill #{bill_num_map.get(t.id)}"
+                if d_str not in dates_grouped:
+                    dates_grouped[d_str] = []
+                dates_grouped[d_str].append(b_num)
+            parts = [f"{d_str} ({', '.join(b_nums)})" for d_str, b_nums in dates_grouped.items()]
+            debit_date_str = ", ".join(parts)
+        else:
+            debit_date_str = "-"
 
         grand_credit = round(grand_credit + credit_total, 2)
         grand_debit = round(grand_debit + debit_total, 2)

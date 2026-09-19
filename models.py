@@ -47,28 +47,47 @@ class Retailer(db.Model):
                 date_to = d_type.fromisoformat(date_to)
             purchases = sum(
                 t.amount for t in self.transactions
-                if t.book == book and t.type == "purchase" and t.created_at.date() <= date_to
+                if t.book == book and t.type == "purchase" and not t.is_archived and t.created_at.date() <= date_to
             )
             payments = sum(
                 t.amount for t in self.transactions
-                if t.book == book and t.type == "payment" and t.created_at.date() <= date_to
+                if t.book == book and t.type == "payment" and not t.is_archived and t.created_at.date() <= date_to
             )
         else:
             purchases = sum(
-                t.amount for t in self.transactions if t.book == book and t.type == "purchase"
+                t.amount for t in self.transactions if t.book == book and t.type == "purchase" and not t.is_archived
             )
             payments = sum(
-                t.amount for t in self.transactions if t.book == book and t.type == "payment"
+                t.amount for t in self.transactions if t.book == book and t.type == "payment" and not t.is_archived
             )
         return round(purchases - payments, 2)
 
     def history(self, book):
+        active_txs = [t for t in self.transactions if t.book == book and not t.is_archived]
+        # Chronological sort to compute sequential bill numbers per book
+        purchases_chrono = sorted(
+            [t for t in active_txs if t.type == "purchase"],
+            key=lambda t: (t.created_at, t.id)
+        )
+        bill_num_map = {t.id: idx + 1 for idx, t in enumerate(purchases_chrono)}
+
         items = sorted(
-            (t for t in self.transactions if t.book == book),
-            key=lambda t: t.created_at,
+            active_txs,
+            key=lambda t: (t.created_at, t.id),
             reverse=True,
         )
-        return [t.to_dict() for t in items]
+        out = []
+        for t in items:
+            d = t.to_dict()
+            if t.type == "purchase":
+                d["bill_number"] = bill_num_map.get(t.id)
+            out.append(d)
+        return out
+
+    def has_archived(self, book=None):
+        if book:
+            return any(t.is_archived for t in self.transactions if t.book == book)
+        return any(t.is_archived for t in self.transactions)
 
     def to_summary_dict(self, book):
         return {
@@ -77,6 +96,7 @@ class Retailer(db.Model):
             "has_santhoor": self.has_santhoor,
             "has_mtr": self.has_mtr,
             "balance": self.balance(book),
+            "has_archived": self.has_archived(book),
         }
 
     def payments_by_date(self, book, date_from=None, date_to=None):
@@ -91,7 +111,7 @@ class Retailer(db.Model):
 
         out = {}
         for t in self.transactions:
-            if t.book != book or t.type != "payment":
+            if t.book != book or t.type != "payment" or t.is_archived:
                 continue
             t_date = t.created_at.date()
             if date_from and t_date < date_from:
@@ -111,6 +131,7 @@ class Transaction(db.Model):
     type = db.Column(db.String(20), nullable=False)  # 'purchase' | 'payment'
     amount = db.Column(db.Float, nullable=False)
     note = db.Column(db.String(200), default="")
+    is_archived = db.Column(db.Boolean, default=False, nullable=False)
     created_at = db.Column(db.DateTime, default=now_ist)
 
     def to_dict(self):
@@ -120,6 +141,7 @@ class Transaction(db.Model):
             "type": self.type,
             "amount": self.amount,
             "note": self.note,
+            "is_archived": self.is_archived,
             "date": self.created_at.strftime("%d %b %Y"),
             "created_at": self.created_at.isoformat(),
         }

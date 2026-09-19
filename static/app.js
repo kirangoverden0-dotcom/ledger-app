@@ -973,9 +973,52 @@ async function renderDetail() {
   };
   page.appendChild(actions);
 
-  page.appendChild(el(`<div class="section-label">History</div>`));
+  const historyHeader = el(`
+    <div style="display:flex;justify-content:space-between;align-items:center;margin:24px 0 10px;">
+      <div class="section-label" style="margin:0;">History</div>
+      <div style="display:flex;gap:8px;">
+        ${r.history.length > 0 ? `<button class="clear-history-btn" id="clearHistBtn" style="background:none;border:1px solid var(--line);border-radius:8px;padding:6px 12px;font-size:13px;font-weight:700;color:var(--due);cursor:pointer;">🗑️ Clear History</button>` : ""}
+        ${r.has_archived ? `<button class="restore-history-btn" id="restoreHistBtn" style="background:none;border:1px solid var(--santhoor);border-radius:8px;padding:6px 12px;font-size:13px;font-weight:700;color:var(--santhoor);cursor:pointer;">↺ Restore History</button>` : ""}
+      </div>
+    </div>
+  `);
+
+  if (historyHeader.querySelector("#clearHistBtn")) {
+    historyHeader.querySelector("#clearHistBtn").onclick = () => {
+      showConfirm({
+        title: "Clear History?",
+        body: `Archive transaction history for ${escapeHtml(r.name)}? This will reset the running balance to ₹0. You can restore records anytime.`,
+        confirmLabel: "Clear History",
+        onConfirm: async () => {
+          hideConfirm();
+          try {
+            await api(`/retailers/${r.id}/clear?book=${state.book}`, { method: "POST" });
+            renderDetail();
+          } catch (e) {
+            alert(e.message || "Could not clear history");
+          }
+        },
+      });
+    };
+  }
+
+  if (historyHeader.querySelector("#restoreHistBtn")) {
+    historyHeader.querySelector("#restoreHistBtn").onclick = async () => {
+      try {
+        await api(`/retailers/${r.id}/restore?book=${state.book}`, { method: "POST" });
+        renderDetail();
+      } catch (e) {
+        alert(e.message || "Could not restore history");
+      }
+    };
+  }
+
+  page.appendChild(historyHeader);
+
   if (r.history.length === 0) {
-    page.appendChild(el(`<div class="empty-note">No entries yet.</div>`));
+    page.appendChild(
+      el(`<div class="empty-note">${r.has_archived ? "History cleared (archived). Tap '↺ Restore History' above to bring entries back." : "No entries yet."}</div>`)
+    );
   } else {
     r.history.forEach((h) => {
       page.appendChild(
@@ -984,7 +1027,7 @@ async function renderDetail() {
           <div>
             <div class="date">${h.date}</div>
             <div class="type ${h.type === "purchase" ? "due" : "clear"}">
-              ${h.type === "purchase" ? "Purchase (added)" : "Payment received"}
+              ${h.type === "purchase" ? `Bill #${h.bill_number}` : "Payment received"}
             </div>
           </div>
           <div class="amt">${h.type === "purchase" ? "+" : "-"}${inr(h.amount)}</div>
@@ -1550,8 +1593,32 @@ async function loadAndRenderReportGrid(container) {
   actionRow.querySelector("#printReportBtn").onclick = () => {
     printGrid(data.from, data.to);
   };
-  actionRow.querySelector("#excelReportBtn").onclick = () => {
-    window.location.href = `/api/reports/excel?book=${data.book}&from=${data.from}&to=${data.to}`;
+  actionRow.querySelector("#excelReportBtn").onclick = async () => {
+    const btn = actionRow.querySelector("#excelReportBtn");
+    const origText = btn.innerHTML;
+    btn.innerHTML = "Downloading…";
+    btn.disabled = true;
+    try {
+      const url = `/api/reports/excel?book=${data.book}&from=${data.from}&to=${data.to}`;
+      const res = await fetch(url, { credentials: "same-origin" });
+      if (!res.ok) throw new Error("Could not generate Excel file.");
+      const blob = await res.blob();
+      const filename = `Ledger_Report_${data.book}_${data.from}_to_${data.to}.xlsx`;
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.style.display = "none";
+      a.href = blobUrl;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
+    } catch (e) {
+      alert(e.message || "Failed to download Excel report.");
+    } finally {
+      btn.innerHTML = origText;
+      btn.disabled = false;
+    }
   };
 
   container.appendChild(actionRow);
