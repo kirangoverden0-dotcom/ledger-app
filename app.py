@@ -45,10 +45,16 @@ with app.app_context():
     db.create_all()
     try:
         from sqlalchemy import text
-        db.session.execute(text("ALTER TABLE transactions ADD COLUMN is_archived BOOLEAN NOT NULL DEFAULT 0"))
+        db.session.execute(text("ALTER TABLE transactions ADD COLUMN is_archived BOOLEAN NOT NULL DEFAULT FALSE"))
         db.session.commit()
     except Exception:
         db.session.rollback()
+
+
+@app.errorhandler(500)
+def internal_error(error):
+    db.session.rollback()
+    return jsonify({"error": "Internal Server Error", "message": str(error)}), 500
 
 
 def get_active_pin():
@@ -804,7 +810,7 @@ def export_excel_report():
         from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
         from openpyxl.utils import get_column_letter
     except ImportError:
-        return jsonify({"error": "openpyxl module is missing. Please run 'pip install openpyxl' or 'pip install -r requirements.txt'"}), 500
+        return jsonify({"error": "openpyxl module is missing. Please run 'pip install openpyxl' or 'pip install -r requirements.txt'"}), 400
 
     book = request.args.get("book", "santhoor")
     from_str = request.args.get("from")
