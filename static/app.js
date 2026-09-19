@@ -6,7 +6,7 @@ const BOOKS = {
 const state = {
   authed: false,
   pinSet: true,
-  screen: "loading", // loading | login | pinSetup | home | list | detail | addRetailer | entry | collectionEntry | monthlyReport
+  screen: "loading", // loading | login | pinSetup | home | list | detail | addRetailer | entry | collectionEntry | billEntry | monthlyReport
   book: "santhoor",
   retailers: [],
   activeRetailer: null,
@@ -25,6 +25,11 @@ const state = {
   collectionRetailerId: null,
   collectionDate: localISODate(new Date()),
   collectionAmount: "",
+  // Bill entry state
+  billBook: "santhoor",
+  billRetailerId: null,
+  billDate: localISODate(new Date()),
+  billAmount: "",
 };
 
 const app = document.getElementById("app");
@@ -144,7 +149,8 @@ function render() {
   if (state.screen === "addRetailer") return app.appendChild(renderAddRetailer());
   if (state.screen === "detail") return renderDetail();
   if (state.screen === "entry") return app.appendChild(renderEntry());
-  if (state.screen === "collectionEntry") return app.appendChild(renderCollectionEntry());
+  if (state.screen === "billEntry") return renderBillEntry();
+  if (state.screen === "collectionEntry") return renderCollectionEntry();
   if (state.screen === "monthlyReport") return renderMonthlyReport();
 }
 
@@ -288,20 +294,11 @@ function showChangePinModal() {
 function addLongPressListener(element, onLongPress, onClick) {
   let timer = null;
   let isLongPress = false;
+  let isMoved = false;
   let startX = 0;
   let startY = 0;
-
-  const start = (e) => {
-    isLongPress = false;
-    const touch = e.touches ? e.touches[0] : e;
-    startX = touch.clientX;
-    startY = touch.clientY;
-    timer = setTimeout(() => {
-      isLongPress = true;
-      if (navigator.vibrate) navigator.vibrate(40);
-      onLongPress(e);
-    }, 500);
-  };
+  let isTouchSequence = false;
+  let touchResetTimeout = null;
 
   const cancel = () => {
     if (timer) {
@@ -310,29 +307,73 @@ function addLongPressListener(element, onLongPress, onClick) {
     }
   };
 
-  const move = (e) => {
-    if (!timer) return;
+  const start = (e) => {
+    cancel();
+    isLongPress = false;
+    isMoved = false;
+
+    const isTouch = e.type.startsWith("touch");
+    if (isTouch) {
+      isTouchSequence = true;
+      if (touchResetTimeout) clearTimeout(touchResetTimeout);
+      touchResetTimeout = setTimeout(() => {
+        isTouchSequence = false;
+      }, 1000);
+    } else if (isTouchSequence) {
+      return;
+    }
+
     const touch = e.touches ? e.touches[0] : e;
-    if (Math.abs(touch.clientX - startX) > 10 || Math.abs(touch.clientY - startY) > 10) {
+    if (!touch) return;
+    startX = touch.clientX;
+    startY = touch.clientY;
+
+    timer = setTimeout(() => {
+      isLongPress = true;
+      if (navigator.vibrate) navigator.vibrate(40);
+      onLongPress(e);
+    }, 500);
+  };
+
+  const move = (e) => {
+    const isTouch = e.type.startsWith("touch");
+    if (!isTouch && isTouchSequence) return;
+
+    const touch = e.touches ? e.touches[0] : (e.changedTouches ? e.changedTouches[0] : e);
+    if (!touch) return;
+
+    const dx = Math.abs(touch.clientX - startX);
+    const dy = Math.abs(touch.clientY - startY);
+    if (dx > 10 || dy > 10) {
+      isMoved = true;
       cancel();
     }
   };
 
   const end = (e) => {
+    const isTouch = e.type.startsWith("touch");
+    if (!isTouch && isTouchSequence) return;
+
     const wasLongPress = isLongPress;
+    const moved = isMoved;
     cancel();
+
     if (wasLongPress) {
       e.preventDefault();
       e.stopPropagation();
-    } else if (onClick) {
+    } else if (!moved && onClick) {
       onClick(e);
     }
+  };
+
+  const handleTouchCancel = () => {
+    cancel();
   };
 
   element.addEventListener("touchstart", start, { passive: true });
   element.addEventListener("touchend", end);
   element.addEventListener("touchmove", move, { passive: true });
-  element.addEventListener("touchcancel", cancel);
+  element.addEventListener("touchcancel", handleTouchCancel);
 
   element.addEventListener("mousedown", (e) => {
     if (e.button !== 0) return;
@@ -547,8 +588,15 @@ async function renderHome() {
   const quickActions = el(`
     <div class="quick-actions-section">
       <div class="section-label" style="margin-top:24px">Quick Actions</div>
-      <button class="action-card-btn collection-btn">
+      <button class="action-card-btn bill-btn">
         <div class="icon">&#128221;</div>
+        <div class="info">
+          <div class="title">Add Bill</div>
+          <div class="desc">Record delivery bill total with retailer, product line & date</div>
+        </div>
+      </button>
+      <button class="action-card-btn collection-btn" style="margin-top:12px">
+        <div class="icon">&#128179;</div>
         <div class="info">
           <div class="title">Daily Collection Entry</div>
           <div class="desc">Record payments with retailer, product line & date</div>
@@ -563,6 +611,15 @@ async function renderHome() {
       </button>
     </div>
   `);
+
+  quickActions.querySelector(".bill-btn").onclick = () => {
+    state.billBook = "santhoor";
+    state.billRetailerId = null;
+    state.billDate = localISODate(new Date());
+    state.billAmount = "";
+    state.screen = "billEntry";
+    render();
+  };
 
   quickActions.querySelector(".collection-btn").onclick = () => {
     state.collectionBook = "santhoor";
@@ -942,6 +999,223 @@ async function renderDetail() {
   page.appendChild(printBtn);
 
   app.appendChild(page);
+}
+
+// ---------------- add bill entry ----------------
+
+async function renderBillEntry() {
+  app.innerHTML = "";
+  app.appendChild(
+    topbar("Add Bill", {
+      back: () => {
+        state.screen = "home";
+        render();
+      },
+    })
+  );
+
+  const page = el(`<div class="page"></div>`);
+
+  // Product Line Tabs
+  const tabs = el(`
+    <div class="product-line-tabs">
+      <button class="tab-btn ${state.billBook === "santhoor" ? "active santhoor" : ""}" id="tabSanthoor">Santoor</button>
+      <button class="tab-btn ${state.billBook === "mtr" ? "active mtr" : ""}" id="tabMtr">MTR</button>
+    </div>
+  `);
+
+  tabs.querySelector("#tabSanthoor").onclick = () => {
+    state.billBook = "santhoor";
+    state.billRetailerId = null;
+    renderBillEntry();
+  };
+  tabs.querySelector("#tabMtr").onclick = () => {
+    state.billBook = "mtr";
+    state.billRetailerId = null;
+    renderBillEntry();
+  };
+  page.appendChild(tabs);
+
+  // Form (3 fields: Retailer, Date, Amount)
+  const form = el(`
+    <div style="margin-top:16px;">
+      <div class="field">
+        <label>Retailer (${BOOKS[state.billBook].label})</label>
+        <div class="searchable-select-wrap" id="billRetailerSearchWrap">
+          <div class="searchable-select-box">
+            <input type="text" class="searchable-select-input" id="billRetailerSearchInput" placeholder="Type retailer name to search..." autocomplete="off" />
+            <button type="button" class="searchable-clear-btn" id="billRetailerClearBtn" style="display:none;" title="Clear selection">✕</button>
+          </div>
+          <div class="searchable-dropdown-list" id="billRetailerDropdownList" style="display:none;"></div>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Bill Date</label>
+        <input type="date" id="billDateInput" value="${state.billDate || localISODate(new Date())}" />
+      </div>
+
+      <div class="field">
+        <label>Total Bill Amount (₹)</label>
+        <div style="position:relative;">
+          <input class="entry-input" id="billAmtInput" inputmode="numeric" placeholder="Enter bill amount" value="${state.billAmount || ""}" style="padding-right:54px;text-align:left;padding-left:18px;" />
+          <button id="billMicBtn" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;font-size:24px;padding:8px;border-radius:999px;cursor:pointer;" title="Voice input (Kannada/English)">🎙️</button>
+        </div>
+        <div id="billSpeechFeedback" style="font-size:14px;color:var(--santhoor);margin-top:6px;min-height:20px;">
+          Tap 🎙️ or keyboard mic to speak amount
+        </div>
+      </div>
+
+      <button class="primary-btn ${BOOKS[state.billBook].cls}" id="saveBillBtn" disabled>Save Bill</button>
+    </div>
+  `);
+
+  const searchInput = form.querySelector("#billRetailerSearchInput");
+  const clearBtn = form.querySelector("#billRetailerClearBtn");
+  const dropdownList = form.querySelector("#billRetailerDropdownList");
+  const dateInput = form.querySelector("#billDateInput");
+  const amtInput = form.querySelector("#billAmtInput");
+  const micBtn = form.querySelector("#billMicBtn");
+  const feedback = form.querySelector("#billSpeechFeedback");
+  const saveBtn = form.querySelector("#saveBillBtn");
+
+  let fetchedRetailers = [];
+
+  const updateSaveDisabled = () => {
+    const val = Number(amtInput.value);
+    saveBtn.disabled = !state.billRetailerId || !val || val <= 0;
+  };
+
+  const renderDropdownItems = (filterQuery) => {
+    dropdownList.innerHTML = "";
+    const q = filterQuery.trim().toLowerCase();
+    const matches = fetchedRetailers.filter((r) => r.name.toLowerCase().includes(q));
+
+    if (matches.length === 0) {
+      dropdownList.innerHTML = `<div class="searchable-empty">No matching retailer found</div>`;
+    } else {
+      matches.forEach((r) => {
+        const item = el(`
+          <div class="searchable-item ${String(r.id) === String(state.billRetailerId) ? "selected" : ""}">
+            <span>${escapeHtml(r.name)}</span>
+            <span class="item-bal ${r.balance > 0 ? "due" : "clear"}">${r.balance > 0 ? inr(r.balance) : "Cleared"}</span>
+          </div>
+        `);
+        item.onmousedown = (e) => {
+          e.preventDefault();
+          selectRetailer(r);
+        };
+        dropdownList.appendChild(item);
+      });
+    }
+  };
+
+  const selectRetailer = (r) => {
+    if (r) {
+      state.billRetailerId = r.id;
+      searchInput.value = `${r.name} (Bal: ${r.balance > 0 ? inr(r.balance) : "Cleared"})`;
+      clearBtn.style.display = "block";
+    } else {
+      state.billRetailerId = null;
+      searchInput.value = "";
+      clearBtn.style.display = "none";
+    }
+    dropdownList.style.display = "none";
+    updateSaveDisabled();
+  };
+
+  searchInput.onfocus = () => {
+    dropdownList.style.display = "block";
+    const q = state.billRetailerId ? "" : searchInput.value;
+    renderDropdownItems(q);
+  };
+
+  searchInput.oninput = () => {
+    state.billRetailerId = null;
+    clearBtn.style.display = searchInput.value ? "block" : "none";
+    dropdownList.style.display = "block";
+    renderDropdownItems(searchInput.value);
+    updateSaveDisabled();
+  };
+
+  clearBtn.onclick = () => {
+    selectRetailer(null);
+    searchInput.focus();
+    dropdownList.style.display = "block";
+    renderDropdownItems("");
+  };
+
+  document.addEventListener("click", function closeBillDropdown(e) {
+    if (!form.contains(e.target)) {
+      dropdownList.style.display = "none";
+    }
+  });
+
+  dateInput.onchange = (e) => {
+    state.billDate = e.target.value;
+  };
+
+  amtInput.oninput = () => {
+    amtInput.value = amtInput.value.replace(/[^0-9]/g, "");
+    state.billAmount = amtInput.value;
+    updateSaveDisabled();
+  };
+
+  micBtn.onclick = () => {
+    feedback.textContent = "Listening... speak amount in Kannada or English";
+    micBtn.style.opacity = "0.5";
+    startSpeechToText(
+      (numberStr) => {
+        amtInput.value = numberStr;
+        state.billAmount = numberStr;
+        feedback.textContent = `Recognized amount: ₹${numberStr}`;
+        micBtn.style.opacity = "1";
+        updateSaveDisabled();
+      },
+      (err) => {
+        feedback.textContent = err || "Could not hear speech. Try keyboard mic.";
+        micBtn.style.opacity = "1";
+      }
+    );
+  };
+
+  saveBtn.onclick = async () => {
+    if (!state.billRetailerId) return;
+    saveBtn.disabled = true;
+    try {
+      await api("/transactions", {
+        method: "POST",
+        body: JSON.stringify({
+          retailer_id: state.billRetailerId,
+          book: state.billBook,
+          type: "purchase",
+          amount: Number(amtInput.value),
+          date: dateInput.value,
+        }),
+      });
+      alert(`Bill of ₹${plainNum(amtInput.value)} saved successfully!`);
+      state.billAmount = "";
+      amtInput.value = "";
+      updateSaveDisabled();
+    } catch (e) {
+      alert(e.message || "Could not save entry.");
+      saveBtn.disabled = false;
+    }
+  };
+
+  page.appendChild(form);
+  app.appendChild(page);
+
+  try {
+    const retailers = await api("/retailers?book=" + state.billBook);
+    fetchedRetailers = retailers.sort((a, b) => a.name.localeCompare(b.name));
+    if (state.billRetailerId) {
+      const match = fetchedRetailers.find((r) => String(r.id) === String(state.billRetailerId));
+      if (match) selectRetailer(match);
+    }
+  } catch (e) {
+    searchInput.placeholder = "Could not load retailers";
+  }
 }
 
 // ---------------- daily collection entry ----------------

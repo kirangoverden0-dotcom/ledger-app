@@ -590,11 +590,13 @@ def create_transaction():
         except ValueError:
             pass
 
+    note = (data.get("note") or "").strip()
     t = Transaction(
         retailer_id=r.id,
         book=book,
         type=ttype,
         amount=amount,
+        note=note,
         created_at=created_timestamp
     )
     db.session.add(t)
