@@ -43,6 +43,12 @@ def add_header(response):
 db.init_app(app)
 with app.app_context():
     db.create_all()
+    try:
+        from sqlalchemy import text
+        db.session.execute(text("ALTER TABLE transactions ADD COLUMN is_archived BOOLEAN NOT NULL DEFAULT 0"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
 
 
 def get_active_pin():
@@ -51,7 +57,7 @@ def get_active_pin():
     if env_pin and env_pin.strip():
         return env_pin.strip()
     # 2. Database Setting if present
-    setting = Setting.query.get("pin")
+    setting = db.session.get(Setting, "pin")
     if setting and setting.value:
         return setting.value
     # No fallback PIN!
@@ -92,7 +98,7 @@ def pin_setup():
     if not new_pin:
         return jsonify({"error": "PIN required"}), 400
 
-    setting = Setting.query.get("pin")
+    setting = db.session.get(Setting, "pin")
     if not setting:
         setting = Setting(key="pin", value=new_pin)
         db.session.add(setting)
@@ -129,7 +135,7 @@ def pin_change():
     if not new_pin:
         return jsonify({"error": "New PIN required"}), 400
 
-    setting = Setting.query.get("pin")
+    setting = db.session.get(Setting, "pin")
     if not setting:
         setting = Setting(key="pin", value=new_pin)
         db.session.add(setting)
@@ -301,7 +307,7 @@ def get_retailer(retailer_id):
     book = request.args.get("book", "santhoor")
     if not valid_book(book):
         return jsonify({"error": "invalid book"}), 400
-    r = Retailer.query.get_or_404(retailer_id)
+    r = db.get_or_404(Retailer, retailer_id)
     return jsonify(
         {
             "id": r.id,
@@ -318,7 +324,7 @@ def get_retailer(retailer_id):
 @app.route("/api/retailers/<int:retailer_id>", methods=["PUT"])
 @login_required
 def update_retailer(retailer_id):
-    r = Retailer.query.get_or_404(retailer_id)
+    r = db.get_or_404(Retailer, retailer_id)
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
     if not name:
@@ -340,7 +346,7 @@ def update_retailer(retailer_id):
 @app.route("/api/retailers/<int:retailer_id>", methods=["DELETE"])
 @login_required
 def delete_retailer(retailer_id):
-    r = Retailer.query.get_or_404(retailer_id)
+    r = db.get_or_404(Retailer, retailer_id)
     tx_count = Transaction.query.filter_by(retailer_id=r.id).count()
     if tx_count > 0:
         return jsonify({
@@ -357,7 +363,7 @@ def delete_retailer(retailer_id):
 @app.route("/api/retailers/<int:retailer_id>/clear", methods=["POST"])
 @login_required
 def clear_retailer_history(retailer_id):
-    r = Retailer.query.get_or_404(retailer_id)
+    r = db.get_or_404(Retailer, retailer_id)
     book = request.args.get("book")
     query = Transaction.query.filter_by(retailer_id=r.id, is_archived=False)
     if book and valid_book(book):
@@ -380,7 +386,7 @@ def clear_retailer_history(retailer_id):
 @app.route("/api/retailers/<int:retailer_id>/restore", methods=["POST"])
 @login_required
 def restore_retailer_history(retailer_id):
-    r = Retailer.query.get_or_404(retailer_id)
+    r = db.get_or_404(Retailer, retailer_id)
     book = request.args.get("book")
     query = Transaction.query.filter_by(retailer_id=r.id, is_archived=True)
     if book and valid_book(book):
@@ -627,7 +633,7 @@ def create_transaction():
     if amount <= 0:
         return jsonify({"error": "amount must be positive"}), 400
 
-    r = Retailer.query.get_or_404(retailer_id)
+    r = db.get_or_404(Retailer, retailer_id)
 
     created_timestamp = now_ist()
     if entry_date:
